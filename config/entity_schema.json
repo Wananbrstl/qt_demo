@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "entity": "Line",
+  "typeId": "cad.entity.line.v1",
+  "properties": [
+    {
+      "id": "start",
+      "type": "point3d",
+      "required": true,
+      "editable": true
+    },
+    {
+      "id": "end",
+      "type": "point3d",
+      "required": true,
+      "editable": true
+    },
+    {
+      "id": "length",
+      "type": "distance",
+      "derived": true,
+      "editable": false
+    }
+  ]
+}

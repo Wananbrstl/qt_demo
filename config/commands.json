@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "commands": [
+    {
+      "name": "LINE",
+      "handlerId": "draw-line",
+      "flags": ["requires-document", "modifies-database"]
+    },
+    {
+      "name": "ZOOM_EXTENTS",
+      "handlerId": "zoom-extents",
+      "flags": ["transparent", "requires-document"]
+    }
+  ]
+}

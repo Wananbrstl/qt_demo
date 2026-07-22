@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "plugins": [
+    {
+      "id": "cad.example.solver",
+      "library": "plugins/cad_solver.dll",
+      "minimumHostApi": 3,
+      "loadPolicy": "on-demand",
+      "requiredExports": [
+        {
+          "name": "cadPluginQueryV3",
+          "abi": "extern-c",
+          "callingConvention": "cdecl"
+        }
+      ],
+      "optionalExports": [
+        "cadPluginDiagnosticsV1"
+      ]
+    }
+  ]
+}
