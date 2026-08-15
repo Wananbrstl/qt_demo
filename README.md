@@ -1,5 +1,7 @@
 # DeviceStudio
 
+[中文说明与进阶教程](README_zh.md)
+
 DeviceStudio is an industrial-style learning workstation for Qt 6, asynchronous
 TCP, and SQLite. It is intentionally small enough to study end to end while
 retaining production-oriented boundaries: UI widgets do not own sockets or SQL
