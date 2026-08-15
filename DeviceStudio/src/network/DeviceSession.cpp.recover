@@ -1,0 +1,261 @@
+#include "network/DeviceSession.h"
+
+#include <QCborMap>
+#include <QCborValue>
+#include <QDateTime>
+#include <QRandomGenerator>
+#include <QTcpSocket>
+#include <QThread>
+#include <QTimer>
+
+namespace ds::network {
+namespace {
+
+constexpr int heartbeatIntervalMs = 2000;
+constexpr int heartbeatTimeoutMs = 6000;
+constexpr int initialReconnectMs = 500;
+constexpr int maximumReconnectMs = 15000;
+
+}  // namespace
+
+DeviceSession::DeviceSession(domain::DeviceId deviceId, QObject* parent)
+    : QObject(parent), deviceId_(std::move(deviceId)) {}
+
+DeviceSession::~DeviceSession() = default;
+
+void DeviceSession::initialize() {
+    Q_ASSERT(QThread::currentThread() == thread());
+    if (socket_) {
+        return;
+    }
+
+    // QTcpSocket and all timers are created after the worker has moved to its
+    // target thread. Creating them in the constructor would bind them to the
+    // GUI thread and violate Qt's thread-affinity rules.
+    socket_ = new QTcpSocket(this);
+    heartbeatTimer_ = new QTimer(this);
+    heartbeatDeadlineTimer_ = new QTimer(this);
+    reconnectTimer_ = new QTimer(this);
+
+    heartbeatTimer_->setInterval(heartbeatIntervalMs);
+    heartbeatDeadlineTimer_->setInterval(1000);
+    reconnectTimer_->setSingleShot(true);
+
+    connect(socket_, &QTcpSocket::connected, this, &DeviceSession::onConnected);
+    connect(socket_, &QTcpSocket::disconnected, this, &DeviceSession::onDisconnected);
+    connect(socket_, &QTcpSocket::readyRead, this, &DeviceSession::onReadyRead);
+    connect(socket_, &QTcpSocket::errorOccurred, this, &DeviceSession::onSocketError);
+    connect(heartbeatTimer_, &QTimer::timeout, this, &DeviceSession::sendHeartbeat);
+    connect(heartbeatDeadlineTimer_, &QTimer::timeout,
+            this, &DeviceSession::checkHeartbeatDeadline);
+    connect(reconnectTimer_, &QTimer::timeout, this, &DeviceSession::attemptReconnect);
+}
+
+void DeviceSession::connectToDevice(domain::DeviceEndpoint endpoint) {
+    if (!socket_) {
+        initialize();
+    }
+    if (!endpoint.isValid()) {
+        emit logMessage(QStringLiteral("network"),
+                        QStringLiteral("Rejected invalid device endpoint"));
+        return;
+    }
+
+    shutdownRequested_ = false;
+    endpoint_ = std::move(endpoint);
+    reconnectAttempt_ = 0;
+    reconnectTimer_->stop();
+    socket_->abort();
+    decoder_.reset();
+    transitionTo(domain::DeviceState::Connecting);
+    socket_->connectToHost(endpoint_.host, endpoint_.port);
+}
+
+void DeviceSession::disconnectFromDevice() {
+    shutdownRequested_ = true;
+    reconnectTimer_->stop();
+    heartbeatTimer_->stop();
+    heartbeatDeadlineTimer_->stop();
+    transitionTo(domain::DeviceState::Stopping);
+    if (socket_) {
+        socket_->disconnectFromHost();
+        if (socket_->state() == QAbstractSocket::UnconnectedState) {
+            transitionTo(domain::DeviceState::Disconnected);
+        }
+    }
+}
+
+void DeviceSession::sendCommand(domain::CommandRequest request) {
+    if (state_ != domain::DeviceState::Online) {
+        emit commandReplyReceived(
+            {request.requestId, false, QStringLiteral("Device is not online")});
+        return;
+    }
+
+    QCborMap map;
+    map.insert(QStringLiteral("requestId"), request.requestId.toString(QUuid::WithoutBraces));
+    map.insert(QStringLiteral("command"), request.command);
+    map.insert(QStringLiteral("arguments"), request.arguments);
+    map.insert(QStringLiteral("requestedAtMs"), request.requestedAtMs);
+    sendFrame(protocol::MessageType::CommandRequest, QCborValue(map).toCbor());
+}
+
+void DeviceSession::shutdown() {
+    disconnectFromDevice();
+    if (socket_) {
+        socket_->abort();
+    }
+}
+
+void DeviceSession::onConnected() {
+    transitionTo(domain::DeviceState::Handshaking);
+    reconnectAttempt_ = 0;
+    lastReceivedAtMs_ = QDateTime::currentMSecsSinceEpoch();
+
+    QCborMap hello;
+    hello.insert(QStringLiteral("client"), QStringLiteral("DeviceStudio"));
+    hello.insert(QStringLiteral("protocolVersion"), protocol::FrameCodec::version);
+    sendFrame(protocol::MessageType::Hello, QCborValue(hello).toCbor());
+}
+
+void DeviceSession::onDisconnected() {
+    heartbeatTimer_->stop();
+    heartbeatDeadlineTimer_->stop();
+    decoder_.reset();
+
+    if (shutdownRequested_) {
+        transitionTo(domain::DeviceState::Disconnected);
+        return;
+    }
+    scheduleReconnect();
+}
+
+void DeviceSession::onReadyRead() {
+    const QByteArray bytes = socket_->readAll();
+    const protocol::DecodeBatch batch = decoder_.append(bytes);
+    lastReceivedAtMs_ = QDateTime::currentMSecsSinceEpoch();
+
+    for (const auto& error : batch.errors) {
+        emit logMessage(QStringLiteral("protocol"), error.message);
+    }
+    for (const auto& frame : batch.frames) {
+        emit protocolTrace(QStringLiteral("RX"), frame);
+        handleFrame(frame);
+    }
+}
+
+void DeviceSession::onSocketError() {
+    emit logMessage(QStringLiteral("network"), socket_->errorString());
+    if (socket_->state() == QAbstractSocket::UnconnectedState && !shutdownRequested_) {
+        scheduleReconnect();
+    }
+}
+
+void DeviceSession::sendHeartbeat() {
+    if (state_ != domain::DeviceState::Online) {
+        return;
+    }
+    QCborMap map;
+    map.insert(QStringLiteral("sentAtMs"), QDateTime::currentMSecsSinceEpoch());
+    sendFrame(protocol::MessageType::Heartbeat, QCborValue(map).toCbor());
+}
+
+void DeviceSession::checkHeartbeatDeadline() {
+    if (state_ != domain::DeviceState::Online) {
+        return;
+    }
+    const qint64 silenceMs = QDateTime::currentMSecsSinceEpoch() - lastReceivedAtMs_;
+    if (silenceMs <= heartbeatTimeoutMs) {
+        return;
+    }
+
+    transitionTo(domain::DeviceState::Degraded);
+    emit logMessage(QStringLiteral("network"),
+                    QStringLiteral("Heartbeat timeout after %1 ms").arg(silenceMs));
+    socket_->abort();
+    scheduleReconnect();
+}
+
+void DeviceSession::attemptReconnect() {
+    if (shutdownRequested_ || !endpoint_.isValid()) {
+        return;
+    }
+    transitionTo(domain::DeviceState::Connecting);
+    socket_->connectToHost(endpoint_.host, endpoint_.port);
+}
+
+void DeviceSession::transitionTo(const domain::DeviceState state) {
+    if (state_ == state) {
+        return;
+    }
+    state_ = state;
+    emit stateChanged(deviceId_, state_);
+    emit logMessage(QStringLiteral("state"), domain::toString(state_));
+}
+
+void DeviceSession::handleFrame(const protocol::Frame& frame) {
+    switch (frame.type) {
+    case protocol::MessageType::HelloAck:
+        transitionTo(domain::DeviceState::Online);
+        heartbeatTimer_->start();
+        heartbeatDeadlineTimer_->start();
+        break;
+    case protocol::MessageType::HeartbeatAck:
+        break;
+    case protocol::MessageType::Telemetry: {
+        const auto sample = protocol::FrameCodec::deserializeTelemetry(frame.payload, deviceId_);
+        if (sample) {
+            emit telemetryReceived(*sample);
+        } else {
+            emit logMessage(QStringLiteral("protocol"),
+                            QStringLiteral("Invalid telemetry payload"));
+        }
+        break;
+    }
+    case protocol::MessageType::CommandReply: {
+        const QCborValue root = QCborValue::fromCbor(frame.payload);
+        if (!root.isMap()) {
+            break;
+        }
+        const QCborMap map = root.toMap();
+        const QUuid id(map.value(QStringLiteral("requestId")).toString());
+        emit commandReplyReceived(
+            {id,
+             map.value(QStringLiteral("accepted")).toBool(),
+             map.value(QStringLiteral("message")).toString()});
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+void DeviceSession::sendFrame(const protocol::MessageType type, const QByteArray& payload) {
+    if (!socket_ || socket_->state() != QAbstractSocket::ConnectedState) {
+        return;
+    }
+    const protocol::Frame frame{type, 0, nextSequence_++, payload};
+    const QByteArray bytes = protocol::FrameCodec::encode(frame);
+    if (socket_->write(bytes) < 0) {
+        emit logMessage(QStringLiteral("network"), socket_->errorString());
+        return;
+    }
+    emit protocolTrace(QStringLiteral("TX"), frame);
+}
+
+void DeviceSession::scheduleReconnect() {
+    if (shutdownRequested_ || reconnectTimer_->isActive()) {
+        return;
+    }
+    transitionTo(domain::DeviceState::Reconnecting);
+
+    // Exponential backoff avoids hammering an unavailable device. A small
+    // random jitter prevents many sessions from reconnecting simultaneously.
+    const int exponent = qMin(reconnectAttempt_, 5);
+    const int baseDelay = qMin(maximumReconnectMs, initialReconnectMs * (1 << exponent));
+    const int jitter = QRandomGenerator::global()->bounded(qMax(1, baseDelay / 5));
+    ++reconnectAttempt_;
+    reconnectTimer_->start(baseDelay + jitter);
+}
+
+}  // namespace ds::network

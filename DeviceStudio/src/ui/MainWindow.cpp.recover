@@ -1,0 +1,232 @@
+#include "ui/MainWindow.h"
+
+#include "application/DeviceApplicationService.h"
+#include "ui/DocumentManager.h"
+#include "ui/docks/DeviceExplorerDock.h"
+#include "ui/docks/DiagnosticsDock.h"
+#include "ui/docks/PropertyInspectorDock.h"
+
+#include <QActionGroup>
+#include <QCloseEvent>
+#include <QLabel>
+#include <QMdiArea>
+#include <QMenuBar>
+#include <QSettings>
+#include <QStatusBar>
+#include <QToolBar>
+
+namespace ds::ui {
+namespace {
+
+constexpr int workspaceStateVersion = 1;
+
+}  // namespace
+
+MainWindow::MainWindow(QWidget* parent)
+    : QMainWindow(parent),
+      service_(new application::DeviceApplicationService(this)) {
+    setObjectName(QStringLiteral("MainWindow"));
+    setWindowTitle(tr("DeviceStudio — Industrial Device Workbench"));
+    resize(1440, 900);
+    buildUi();
+    service_->start();
+
+    // Opening the primary monitor gives first-time users an immediately useful
+    // workspace while preserving normal MDI close/reopen behavior.
+    documentManager_->openDeviceMonitor(service_->deviceId());
+}
+
+MainWindow::~MainWindow() = default;
+
+void MainWindow::closeEvent(QCloseEvent* event) {
+    saveWorkspace();
+    documentManager_->closeAll();
+    service_->shutdown();
+    event->accept();
+}
+
+void MainWindow::updateConnectionState(const domain::DeviceId deviceId,
+                                       const domain::DeviceState state) {
+    Q_UNUSED(deviceId)
+    connectionStatus_->setText(tr("Connection: %1").arg(domain::toString(state)));
+    connectAction_->setEnabled(state == domain::DeviceState::Disconnected
+                               || state == domain::DeviceState::Reconnecting);
+    disconnectAction_->setEnabled(state != domain::DeviceState::Disconnected
+                                  && state != domain::DeviceState::Stopping);
+}
+
+void MainWindow::resetLayout() {
+    addDockWidget(Qt::LeftDockWidgetArea, deviceExplorer_);
+    addDockWidget(Qt::RightDockWidgetArea, propertyInspector_);
+    addDockWidget(Qt::BottomDockWidgetArea, diagnostics_);
+    deviceExplorer_->show();
+    propertyInspector_->show();
+    diagnostics_->show();
+    resizeDocks({deviceExplorer_, propertyInspector_}, {260, 280}, Qt::Horizontal);
+    resizeDocks({diagnostics_}, {220}, Qt::Vertical);
+}
+
+void MainWindow::buildUi() {
+    mdiArea_ = new QMdiArea(this);
+    mdiArea_->setViewMode(QMdiArea::TabbedView);
+    mdiArea_->setTabsClosable(true);
+    mdiArea_->setTabsMovable(true);
+    mdiArea_->setDocumentMode(true);
+    setCentralWidget(mdiArea_);
+
+    documentManager_ = new DocumentManager(mdiArea_, service_, this);
+    createActions();
+    createMenus();
+    createToolBars();
+    createDocks();
+
+    connectionStatus_ = new QLabel(tr("Connection: Disconnected"), this);
+    databaseStatus_ = new QLabel(tr("Database: Starting"), this);
+    statusBar()->addPermanentWidget(connectionStatus_);
+    statusBar()->addPermanentWidget(databaseStatus_);
+
+    connectUi();
+    restoreWorkspace();
+}
+
+void MainWindow::createActions() {
+    connectAction_ = new QAction(tr("Connect"), this);
+    connectAction_->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_K));
+    disconnectAction_ = new QAction(tr("Disconnect"), this);
+    disconnectAction_->setEnabled(false);
+    openMonitorAction_ = new QAction(tr("Device Monitor"), this);
+    openHistoryAction_ = new QAction(tr("History Query"), this);
+    openProtocolAction_ = new QAction(tr("Protocol Inspector"), this);
+
+    tabbedViewAction_ = new QAction(tr("Tabbed Documents"), this);
+    subWindowViewAction_ = new QAction(tr("Subwindows"), this);
+    tabbedViewAction_->setCheckable(true);
+    subWindowViewAction_->setCheckable(true);
+    tabbedViewAction_->setChecked(true);
+    auto* viewGroup = new QActionGroup(this);
+    viewGroup->setExclusive(true);
+    viewGroup->addAction(tabbedViewAction_);
+    viewGroup->addAction(subWindowViewAction_);
+}
+
+void MainWindow::createMenus() {
+    QMenu* deviceMenu = menuBar()->addMenu(tr("&Device"));
+    deviceMenu->addAction(connectAction_);
+    deviceMenu->addAction(disconnectAction_);
+    deviceMenu->addSeparator();
+    deviceMenu->addAction(openMonitorAction_);
+    deviceMenu->addAction(openHistoryAction_);
+    deviceMenu->addAction(openProtocolAction_);
+
+    QMenu* viewMenu = menuBar()->addMenu(tr("&View"));
+    viewMenu->addAction(tabbedViewAction_);
+    viewMenu->addAction(subWindowViewAction_);
+    viewMenu->addSeparator();
+    QAction* resetAction = viewMenu->addAction(tr("Reset Dock Layout"));
+    connect(resetAction, &QAction::triggered, this, &MainWindow::resetLayout);
+
+    QMenu* windowMenu = menuBar()->addMenu(tr("&Window"));
+    QAction* cascade = windowMenu->addAction(tr("Cascade"));
+    QAction* tile = windowMenu->addAction(tr("Tile"));
+    QAction* closeCurrent = windowMenu->addAction(tr("Close Current"));
+    QAction* closeAll = windowMenu->addAction(tr("Close All"));
+    connect(cascade, &QAction::triggered, mdiArea_, &QMdiArea::cascadeSubWindows);
+    connect(tile, &QAction::triggered, mdiArea_, &QMdiArea::tileSubWindows);
+    connect(closeCurrent, &QAction::triggered, mdiArea_, &QMdiArea::closeActiveSubWindow);
+    connect(closeAll, &QAction::triggered, mdiArea_, &QMdiArea::closeAllSubWindows);
+}
+
+void MainWindow::createToolBars() {
+    auto* deviceToolBar = addToolBar(tr("Device"));
+    deviceToolBar->setObjectName(QStringLiteral("DeviceToolBar"));
+    deviceToolBar->addAction(connectAction_);
+    deviceToolBar->addAction(disconnectAction_);
+    deviceToolBar->addSeparator();
+    deviceToolBar->addAction(openMonitorAction_);
+    deviceToolBar->addAction(openHistoryAction_);
+    deviceToolBar->addAction(openProtocolAction_);
+}
+
+void MainWindow::createDocks() {
+    deviceExplorer_ = new DeviceExplorerDock(service_->deviceId(), this);
+    propertyInspector_ = new PropertyInspectorDock(this);
+    diagnostics_ = new DiagnosticsDock(this);
+    addDockWidget(Qt::LeftDockWidgetArea, deviceExplorer_);
+    addDockWidget(Qt::RightDockWidgetArea, propertyInspector_);
+    addDockWidget(Qt::BottomDockWidgetArea, diagnostics_);
+}
+
+void MainWindow::connectUi() {
+    const domain::DeviceEndpoint defaultEndpoint{QStringLiteral("127.0.0.1"), 45454};
+    connect(connectAction_, &QAction::triggered, this, [this, defaultEndpoint] {
+        service_->connectDevice(defaultEndpoint);
+    });
+    connect(disconnectAction_, &QAction::triggered,
+            service_, &application::DeviceApplicationService::disconnectDevice);
+    connect(openMonitorAction_, &QAction::triggered, this, [this] {
+        documentManager_->openDeviceMonitor(service_->deviceId());
+    });
+    connect(openHistoryAction_, &QAction::triggered, this, [this] {
+        documentManager_->openHistory(service_->deviceId());
+    });
+    connect(openProtocolAction_, &QAction::triggered, this, [this] {
+        documentManager_->openProtocolInspector(service_->deviceId());
+    });
+
+    connect(tabbedViewAction_, &QAction::triggered, this, [this] {
+        mdiArea_->setViewMode(QMdiArea::TabbedView);
+    });
+    connect(subWindowViewAction_, &QAction::triggered, this, [this] {
+        mdiArea_->setViewMode(QMdiArea::SubWindowView);
+    });
+
+    connect(deviceExplorer_, &DeviceExplorerDock::openMonitorRequested,
+            documentManager_, &DocumentManager::openDeviceMonitor);
+    connect(deviceExplorer_, &DeviceExplorerDock::openHistoryRequested,
+            documentManager_, &DocumentManager::openHistory);
+    connect(deviceExplorer_, &DeviceExplorerDock::openProtocolRequested,
+            documentManager_, &DocumentManager::openProtocolInspector);
+    connect(deviceExplorer_, &DeviceExplorerDock::connectRequested,
+            service_, &application::DeviceApplicationService::connectDevice);
+    connect(deviceExplorer_, &DeviceExplorerDock::disconnectRequested,
+            service_, &application::DeviceApplicationService::disconnectDevice);
+    connect(deviceExplorer_, &DeviceExplorerDock::deviceSelected,
+            propertyInspector_, &PropertyInspectorDock::inspectDevice);
+
+    connect(service_, &application::DeviceApplicationService::stateChanged,
+            this, &MainWindow::updateConnectionState);
+    connect(service_, &application::DeviceApplicationService::stateChanged,
+            deviceExplorer_, &DeviceExplorerDock::updateDeviceState);
+    connect(service_, &application::DeviceApplicationService::stateChanged,
+            propertyInspector_, &PropertyInspectorDock::updateState);
+    connect(service_, &application::DeviceApplicationService::logMessage,
+            diagnostics_, &DiagnosticsDock::appendLog);
+    connect(service_, &application::DeviceApplicationService::databaseStatusChanged,
+            diagnostics_, &DiagnosticsDock::setDatabaseStatus);
+    connect(service_, &application::DeviceApplicationService::databaseStatusChanged,
+            this, [this](const bool ready, const QString&) {
+                databaseStatus_->setText(ready ? tr("Database: Ready")
+                                               : tr("Database: Error"));
+            });
+}
+
+void MainWindow::restoreWorkspace() {
+    QSettings settings;
+    const QByteArray geometry = settings.value(QStringLiteral("mainWindow/geometry")).toByteArray();
+    const QByteArray state = settings.value(QStringLiteral("mainWindow/stateV1")).toByteArray();
+    if (!geometry.isEmpty()) {
+        restoreGeometry(geometry);
+    }
+    if (!state.isEmpty() && !restoreState(state, workspaceStateVersion)) {
+        resetLayout();
+    }
+}
+
+void MainWindow::saveWorkspace() const {
+    QSettings settings;
+    settings.setValue(QStringLiteral("mainWindow/geometry"), saveGeometry());
+    settings.setValue(QStringLiteral("mainWindow/stateV1"),
+                      saveState(workspaceStateVersion));
+}
+
+}  // namespace ds::ui

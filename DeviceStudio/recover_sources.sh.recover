@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source_root=/mnt/e/design/DeviceStudio
+target_root=/home/wananbrstl/projects/DeviceStudio
+
+while IFS= read -r -d '' source_file; do
+    relative_path=${source_file#"${source_root}/"}
+    relative_path=${relative_path%.recover}
+    target_file="${target_root}/${relative_path}"
+    install -D -m 0644 "${source_file}" "${target_file}"
+done < <(find "${source_root}" -type f \( -name '*.h.recover' -o -name '*.cpp.recover' \) -print0)
+
+echo "Recovered source files:"
+find "${target_root}" -type f \( -name '*.h' -o -name '*.cpp' \) | sort

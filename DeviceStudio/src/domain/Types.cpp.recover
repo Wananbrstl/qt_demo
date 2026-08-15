@@ -1,0 +1,42 @@
+#include "domain/Types.h"
+
+#include <QHashFunctions>
+
+namespace ds::domain {
+
+size_t qHash(const DeviceId& id, const size_t seed) noexcept {
+    return ::qHash(id.value, seed);
+}
+
+QString toString(const DeviceState state) {
+    switch (state) {
+    case DeviceState::Disconnected:
+        return QStringLiteral("Disconnected");
+    case DeviceState::Connecting:
+        return QStringLiteral("Connecting");
+    case DeviceState::Handshaking:
+        return QStringLiteral("Handshaking");
+    case DeviceState::Online:
+        return QStringLiteral("Online");
+    case DeviceState::Degraded:
+        return QStringLiteral("Degraded");
+    case DeviceState::Reconnecting:
+        return QStringLiteral("Reconnecting");
+    case DeviceState::Stopping:
+        return QStringLiteral("Stopping");
+    }
+    return QStringLiteral("Unknown");
+}
+
+void registerMetaTypes() {
+    qRegisterMetaType<DeviceId>();
+    qRegisterMetaType<DeviceEndpoint>();
+    qRegisterMetaType<DeviceState>();
+    qRegisterMetaType<TelemetrySample>();
+    qRegisterMetaType<CommandRequest>();
+    qRegisterMetaType<CommandReply>();
+    qRegisterMetaType<HistoryQuery>();
+    qRegisterMetaType<QVector<TelemetrySample>>();
+}
+
+}  // namespace ds::domain

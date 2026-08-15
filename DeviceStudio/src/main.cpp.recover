@@ -1,0 +1,20 @@
+#include "domain/Types.h"
+#include "ui/MainWindow.h"
+
+#include <QApplication>
+#include <QCoreApplication>
+
+int main(int argc, char* argv[]) {
+    // High-DPI behavior is enabled by default in Qt 6. Setting stable metadata
+    // before QApplication construction also gives QSettings deterministic paths.
+    QCoreApplication::setOrganizationName(QStringLiteral("DeviceStudioLearning"));
+    QCoreApplication::setApplicationName(QStringLiteral("DeviceStudio"));
+    QCoreApplication::setApplicationVersion(QStringLiteral("0.1.0"));
+
+    QApplication application(argc, argv);
+    ds::domain::registerMetaTypes();
+
+    ds::ui::MainWindow window;
+    window.show();
+    return application.exec();
+}

@@ -1,0 +1,67 @@
+#include "ui/DocumentManager.h"
+
+#include "application/DeviceApplicationService.h"
+#include "ui/documents/DeviceMonitorDocument.h"
+#include "ui/documents/HistoryDocument.h"
+#include "ui/documents/ProtocolInspectorDocument.h"
+
+#include <QMdiArea>
+#include <QMdiSubWindow>
+
+namespace ds::ui {
+
+DocumentManager::DocumentManager(QMdiArea* mdiArea,
+                                 application::DeviceApplicationService* service,
+                                 QObject* parent)
+    : QObject(parent), mdiArea_(mdiArea), service_(service) {}
+
+void DocumentManager::openDeviceMonitor(const domain::DeviceId& deviceId) {
+    const QString key = QStringLiteral("monitor:%1").arg(deviceId.value);
+    activateOrCreate(key, [this, deviceId] {
+        return new DeviceMonitorDocument(deviceId, service_);
+    });
+}
+
+void DocumentManager::openHistory(const domain::DeviceId& deviceId) {
+    // History queries are intentionally not unique: operators often compare
+    // independent time ranges side by side.
+    const QString key = QStringLiteral("history:%1:%2")
+                            .arg(deviceId.value)
+                            .arg(++historyCounter_);
+    addDocument(key, new HistoryDocument(deviceId, service_));
+}
+
+void DocumentManager::openProtocolInspector(const domain::DeviceId& deviceId) {
+    const QString key = QStringLiteral("protocol:%1").arg(deviceId.value);
+    activateOrCreate(key, [this, deviceId] {
+        return new ProtocolInspectorDocument(deviceId, service_);
+    });
+}
+
+void DocumentManager::closeAll() {
+    mdiArea_->closeAllSubWindows();
+}
+
+void DocumentManager::addDocument(const QString& key, QWidget* document) {
+    QMdiSubWindow* subWindow = mdiArea_->addSubWindow(document);
+    subWindow->setAttribute(Qt::WA_DeleteOnClose);
+    subWindow->setWindowTitle(document->windowTitle());
+    documents_.insert(key, subWindow);
+    connect(subWindow, &QObject::destroyed, this, [this, key] {
+        documents_.remove(key);
+    });
+    subWindow->show();
+    mdiArea_->setActiveSubWindow(subWindow);
+}
+
+void DocumentManager::activateOrCreate(const QString& key,
+                                       const std::function<QWidget*()>& factory) {
+    if (const QPointer<QMdiSubWindow> existing = documents_.value(key); existing) {
+        mdiArea_->setActiveSubWindow(existing);
+        existing->showNormal();
+        return;
+    }
+    addDocument(key, factory());
+}
+
+}  // namespace ds::ui

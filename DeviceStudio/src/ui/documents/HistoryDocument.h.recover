@@ -1,0 +1,42 @@
+#pragma once
+
+#include "domain/Types.h"
+
+#include <QWidget>
+
+class QDateTimeEdit;
+class QLabel;
+class QTableView;
+
+namespace ds::application {
+class DeviceApplicationService;
+}
+
+namespace ds::ui {
+
+class TelemetryTableModel;
+
+class HistoryDocument final : public QWidget {
+    Q_OBJECT
+
+public:
+    HistoryDocument(domain::DeviceId deviceId,
+                    application::DeviceApplicationService* service,
+                    QWidget* parent = nullptr);
+
+private slots:
+    void executeQuery();
+    void onHistoryReady(domain::HistoryQuery query,
+                        QVector<domain::TelemetrySample> samples);
+
+private:
+    domain::DeviceId deviceId_;
+    application::DeviceApplicationService* service_{};
+    QDateTimeEdit* fromEdit_{};
+    QDateTimeEdit* toEdit_{};
+    QLabel* resultLabel_{};
+    TelemetryTableModel* model_{};
+    QTableView* table_{};
+};
+
+}  // namespace ds::ui

@@ -1,0 +1,49 @@
+#pragma once
+
+#include "protocol/FrameCodec.h"
+
+#include <QHash>
+#include <QObject>
+
+class QTcpServer;
+class QTcpSocket;
+class QTimer;
+
+namespace ds::simulator {
+
+// The simulator is a deterministic local TCP peer used for development,
+// integration tests, and protocol experiments when no physical device exists.
+class DeviceSimulator final : public QObject {
+    Q_OBJECT
+
+public:
+    explicit DeviceSimulator(QObject* parent = nullptr);
+    ~DeviceSimulator() override;
+
+    [[nodiscard]] bool listen(quint16 port);
+
+private slots:
+    void acceptConnections();
+    void readClient();
+    void removeClient();
+    void broadcastTelemetry();
+
+private:
+    struct ClientContext final {
+        protocol::FrameDecoder decoder;
+        quint32 nextSequence{1};
+    };
+
+    void handleFrame(QTcpSocket* socket, ClientContext* context,
+                     const protocol::Frame& frame);
+    void sendFrame(QTcpSocket* socket, ClientContext* context,
+                   protocol::MessageType type, const QByteArray& payload = {});
+
+    QTcpServer* server_{};
+    QTimer* telemetryTimer_{};
+    QHash<QTcpSocket*, ClientContext*> clients_;
+    bool spindleRunning_{};
+    double phase_{};
+};
+
+}  // namespace ds::simulator

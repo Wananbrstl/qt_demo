@@ -1,0 +1,67 @@
+#pragma once
+
+#include "domain/Types.h"
+#include "protocol/FrameCodec.h"
+
+#include <QObject>
+#include <QPointer>
+
+class QTcpSocket;
+class QTimer;
+
+namespace ds::network {
+
+// DeviceSession lives entirely in the network thread. Public operations are
+// slots so callers can invoke them using queued connections without touching
+// QTcpSocket from the GUI thread.
+class DeviceSession final : public QObject {
+    Q_OBJECT
+
+public:
+    explicit DeviceSession(domain::DeviceId deviceId, QObject* parent = nullptr);
+    ~DeviceSession() override;
+
+public slots:
+    void initialize();
+    void connectToDevice(domain::DeviceEndpoint endpoint);
+    void disconnectFromDevice();
+    void sendCommand(domain::CommandRequest request);
+    void shutdown();
+
+signals:
+    void stateChanged(ds::domain::DeviceId deviceId, ds::domain::DeviceState state);
+    void telemetryReceived(ds::domain::TelemetrySample sample);
+    void commandReplyReceived(ds::domain::CommandReply reply);
+    void protocolTrace(QString direction, ds::protocol::Frame frame);
+    void logMessage(QString category, QString message);
+
+private slots:
+    void onConnected();
+    void onDisconnected();
+    void onReadyRead();
+    void onSocketError();
+    void sendHeartbeat();
+    void checkHeartbeatDeadline();
+    void attemptReconnect();
+
+private:
+    void transitionTo(domain::DeviceState state);
+    void handleFrame(const protocol::Frame& frame);
+    void sendFrame(protocol::MessageType type, const QByteArray& payload = {});
+    void scheduleReconnect();
+
+    domain::DeviceId deviceId_;
+    domain::DeviceEndpoint endpoint_;
+    domain::DeviceState state_{domain::DeviceState::Disconnected};
+    QTcpSocket* socket_{};
+    QTimer* heartbeatTimer_{};
+    QTimer* heartbeatDeadlineTimer_{};
+    QTimer* reconnectTimer_{};
+    protocol::FrameDecoder decoder_;
+    quint32 nextSequence_{1};
+    int reconnectAttempt_{};
+    qint64 lastReceivedAtMs_{};
+    bool shutdownRequested_{};
+};
+
+}  // namespace ds::network

@@ -1,0 +1,29 @@
+#pragma once
+
+#include "domain/Types.h"
+
+#include <QDockWidget>
+
+class QLabel;
+
+namespace ds::ui {
+
+class PropertyInspectorDock final : public QDockWidget {
+    Q_OBJECT
+
+public:
+    explicit PropertyInspectorDock(QWidget* parent = nullptr);
+
+public slots:
+    void inspectDevice(domain::DeviceId deviceId, domain::DeviceEndpoint endpoint);
+    void updateState(domain::DeviceId deviceId, domain::DeviceState state);
+
+private:
+    domain::DeviceId inspectedId_;
+    QLabel* idValue_{};
+    QLabel* hostValue_{};
+    QLabel* portValue_{};
+    QLabel* stateValue_{};
+};
+
+}  // namespace ds::ui

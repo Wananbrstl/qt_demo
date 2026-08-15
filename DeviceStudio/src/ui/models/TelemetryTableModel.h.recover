@@ -1,0 +1,36 @@
+#pragma once
+
+#include "domain/Types.h"
+
+#include <QAbstractTableModel>
+#include <QVector>
+
+namespace ds::ui {
+
+class TelemetryTableModel final : public QAbstractTableModel {
+    Q_OBJECT
+
+public:
+    enum Column { TimeColumn, TemperatureColumn, RpmColumn, VibrationColumn,
+                  LoadColumn, ColumnCount };
+
+    explicit TelemetryTableModel(QObject* parent = nullptr);
+
+    int rowCount(const QModelIndex& parent = {}) const override;
+    int columnCount(const QModelIndex& parent = {}) const override;
+    QVariant data(const QModelIndex& index, int role) const override;
+    QVariant headerData(int section, Qt::Orientation orientation,
+                        int role) const override;
+
+    void appendSample(domain::TelemetrySample sample);
+    void setSamples(QVector<domain::TelemetrySample> samples);
+    [[nodiscard]] const QVector<domain::TelemetrySample>& samples() const noexcept {
+        return samples_;
+    }
+
+private:
+    static constexpr int maximumLiveRows = 500;
+    QVector<domain::TelemetrySample> samples_;
+};
+
+}  // namespace ds::ui

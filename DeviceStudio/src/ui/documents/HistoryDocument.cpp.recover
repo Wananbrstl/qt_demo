@@ -1,0 +1,80 @@
+#include "ui/documents/HistoryDocument.h"
+
+#include "application/DeviceApplicationService.h"
+#include "ui/UiMetrics.h"
+#include "ui/models/TelemetryTableModel.h"
+
+#include <QDateTimeEdit>
+#include <QFormLayout>
+#include <QHeaderView>
+#include <QLabel>
+#include <QPushButton>
+#include <QTableView>
+#include <QVBoxLayout>
+
+namespace ds::ui {
+
+HistoryDocument::HistoryDocument(domain::DeviceId deviceId,
+                                 application::DeviceApplicationService* service,
+                                 QWidget* parent)
+    : QWidget(parent), deviceId_(std::move(deviceId)), service_(service) {
+    setWindowTitle(tr("History — %1").arg(deviceId_.value));
+
+    auto* root = new QVBoxLayout(this);
+    root->setContentsMargins(metrics::pageMargin, metrics::pageMargin,
+                             metrics::pageMargin, metrics::pageMargin);
+
+    auto* queryLayout = new QHBoxLayout;
+    fromEdit_ = new QDateTimeEdit(QDateTime::currentDateTime().addSecs(-3600), this);
+    toEdit_ = new QDateTimeEdit(QDateTime::currentDateTime(), this);
+    fromEdit_->setCalendarPopup(true);
+    toEdit_->setCalendarPopup(true);
+    auto* queryButton = new QPushButton(tr("Query"), this);
+    resultLabel_ = new QLabel(tr("No query executed"), this);
+    queryLayout->addWidget(new QLabel(tr("From:"), this));
+    queryLayout->addWidget(fromEdit_);
+    queryLayout->addWidget(new QLabel(tr("To:"), this));
+    queryLayout->addWidget(toEdit_);
+    queryLayout->addWidget(queryButton);
+    queryLayout->addStretch(1);
+    queryLayout->addWidget(resultLabel_);
+
+    model_ = new TelemetryTableModel(this);
+    table_ = new QTableView(this);
+    table_->setModel(model_);
+    table_->setAlternatingRowColors(true);
+    table_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    table_->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+    root->addLayout(queryLayout);
+    root->addWidget(table_, 1);
+
+    connect(queryButton, &QPushButton::clicked,
+            this, &HistoryDocument::executeQuery);
+    connect(service_, &application::DeviceApplicationService::historyReady,
+            this, &HistoryDocument::onHistoryReady);
+}
+
+void HistoryDocument::executeQuery() {
+    if (fromEdit_->dateTime() > toEdit_->dateTime()) {
+        resultLabel_->setText(tr("Invalid time range"));
+        return;
+    }
+    resultLabel_->setText(tr("Querying…"));
+    service_->requestHistory({deviceId_,
+                              fromEdit_->dateTime().toMSecsSinceEpoch(),
+                              toEdit_->dateTime().toMSecsSinceEpoch(),
+                              1000,
+                              0});
+}
+
+void HistoryDocument::onHistoryReady(const domain::HistoryQuery query,
+                                     QVector<domain::TelemetrySample> samples) {
+    if (!(query.deviceId == deviceId_)) {
+        return;
+    }
+    const qsizetype count = samples.size();
+    model_->setSamples(std::move(samples));
+    resultLabel_->setText(tr("%1 rows").arg(count));
+}
+
+}  // namespace ds::ui

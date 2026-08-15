@@ -1,0 +1,56 @@
+#include "ui/documents/ProtocolInspectorDocument.h"
+
+#include "application/DeviceApplicationService.h"
+#include "ui/UiMetrics.h"
+
+#include <QCheckBox>
+#include <QDateTime>
+#include <QFontDatabase>
+#include <QHBoxLayout>
+#include <QLabel>
+#include <QPlainTextEdit>
+#include <QPushButton>
+#include <QVBoxLayout>
+
+namespace ds::ui {
+
+ProtocolInspectorDocument::ProtocolInspectorDocument(
+    domain::DeviceId deviceId,
+    application::DeviceApplicationService* service,
+    QWidget* parent)
+    : QWidget(parent), deviceId_(std::move(deviceId)) {
+    setWindowTitle(tr("Protocol Inspector — %1").arg(deviceId_.value));
+    auto* root = new QVBoxLayout(this);
+    root->setContentsMargins(metrics::pageMargin, metrics::pageMargin,
+                             metrics::pageMargin, metrics::pageMargin);
+    auto* controls = new QHBoxLayout;
+    auto* clearButton = new QPushButton(tr("Clear"), this);
+    auto* hint = new QLabel(tr("Frames are shown after CRC validation"), this);
+    controls->addWidget(clearButton);
+    controls->addWidget(hint);
+    controls->addStretch(1);
+    output_ = new QPlainTextEdit(this);
+    output_->setReadOnly(true);
+    output_->setMaximumBlockCount(5000);
+    output_->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
+    root->addLayout(controls);
+    root->addWidget(output_, 1);
+
+    connect(clearButton, &QPushButton::clicked, output_, &QPlainTextEdit::clear);
+    connect(service, &application::DeviceApplicationService::protocolTrace,
+            this, &ProtocolInspectorDocument::appendFrame);
+}
+
+void ProtocolInspectorDocument::appendFrame(const QString& direction,
+                                            const protocol::Frame& frame) {
+    output_->appendPlainText(
+        QStringLiteral("%1 %-2 %2 type=%3 seq=%4 bytes=%5\n  %6")
+            .arg(QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss.zzz")),
+                 direction)
+            .arg(static_cast<quint16>(frame.type))
+            .arg(frame.sequence)
+            .arg(frame.payload.size())
+            .arg(QString::fromLatin1(frame.payload.toHex(' '))));
+}
+
+}  // namespace ds::ui

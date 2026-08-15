@@ -1,0 +1,44 @@
+#pragma once
+
+#include "domain/Types.h"
+
+#include <QHash>
+#include <QObject>
+#include <QPointer>
+
+#include <functional>
+
+class QMdiArea;
+class QMdiSubWindow;
+class QWidget;
+
+namespace ds::application {
+class DeviceApplicationService;
+}
+
+namespace ds::ui {
+
+class DocumentManager final : public QObject {
+    Q_OBJECT
+
+public:
+    DocumentManager(QMdiArea* mdiArea,
+                    application::DeviceApplicationService* service,
+                    QObject* parent = nullptr);
+
+    void openDeviceMonitor(const domain::DeviceId& deviceId);
+    void openHistory(const domain::DeviceId& deviceId);
+    void openProtocolInspector(const domain::DeviceId& deviceId);
+    void closeAll();
+
+private:
+    void addDocument(const QString& key, QWidget* document);
+    void activateOrCreate(const QString& key, const std::function<QWidget*()>& factory);
+
+    QMdiArea* mdiArea_{};
+    application::DeviceApplicationService* service_{};
+    QHash<QString, QPointer<QMdiSubWindow>> documents_;
+    quint64 historyCounter_{};
+};
+
+}  // namespace ds::ui

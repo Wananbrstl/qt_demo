@@ -1,0 +1,9 @@
+/build/
+/.cache/
+/compile_commands.json
+/.vscode/*.log
+*.user
+*.db
+*.db-shm
+*.db-wal
+

@@ -1,0 +1,45 @@
+#pragma once
+
+#include "domain/Types.h"
+
+#include <QDockWidget>
+
+class QLineEdit;
+class QSortFilterProxyModel;
+class QTreeView;
+
+namespace ds::ui {
+
+class DeviceTreeModel;
+
+class DeviceExplorerDock final : public QDockWidget {
+    Q_OBJECT
+
+public:
+    explicit DeviceExplorerDock(domain::DeviceId deviceId, QWidget* parent = nullptr);
+
+public slots:
+    void updateDeviceState(domain::DeviceId deviceId, domain::DeviceState state);
+
+signals:
+    void openMonitorRequested(ds::domain::DeviceId deviceId);
+    void openHistoryRequested(ds::domain::DeviceId deviceId);
+    void openProtocolRequested(ds::domain::DeviceId deviceId);
+    void connectRequested(ds::domain::DeviceEndpoint endpoint);
+    void disconnectRequested();
+    void deviceSelected(ds::domain::DeviceId deviceId,
+                        ds::domain::DeviceEndpoint endpoint);
+
+private:
+    void buildUi();
+    void showContextMenu(const QPoint& position);
+    [[nodiscard]] QModelIndex currentSourceIndex() const;
+
+    domain::DeviceId deviceId_;
+    DeviceTreeModel* model_{};
+    QSortFilterProxyModel* proxyModel_{};
+    QLineEdit* filterEdit_{};
+    QTreeView* treeView_{};
+};
+
+}  // namespace ds::ui

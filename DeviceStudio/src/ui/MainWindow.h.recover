@@ -1,0 +1,64 @@
+#pragma once
+
+#include "domain/Types.h"
+
+#include <QMainWindow>
+
+class QAction;
+class QLabel;
+class QMdiArea;
+
+namespace ds::application {
+class DeviceApplicationService;
+}
+
+namespace ds::ui {
+
+class DeviceExplorerDock;
+class DiagnosticsDock;
+class DocumentManager;
+class PropertyInspectorDock;
+
+class MainWindow final : public QMainWindow {
+    Q_OBJECT
+
+public:
+    explicit MainWindow(QWidget* parent = nullptr);
+    ~MainWindow() override;
+
+protected:
+    void closeEvent(QCloseEvent* event) override;
+
+private slots:
+    void updateConnectionState(domain::DeviceId deviceId, domain::DeviceState state);
+    void resetLayout();
+
+private:
+    void buildUi();
+    void createActions();
+    void createMenus();
+    void createToolBars();
+    void createDocks();
+    void connectUi();
+    void restoreWorkspace();
+    void saveWorkspace() const;
+
+    application::DeviceApplicationService* service_{};
+    QMdiArea* mdiArea_{};
+    DocumentManager* documentManager_{};
+    DeviceExplorerDock* deviceExplorer_{};
+    PropertyInspectorDock* propertyInspector_{};
+    DiagnosticsDock* diagnostics_{};
+    QLabel* connectionStatus_{};
+    QLabel* databaseStatus_{};
+
+    QAction* connectAction_{};
+    QAction* disconnectAction_{};
+    QAction* openMonitorAction_{};
+    QAction* openHistoryAction_{};
+    QAction* openProtocolAction_{};
+    QAction* tabbedViewAction_{};
+    QAction* subWindowViewAction_{};
+};
+
+}  // namespace ds::ui

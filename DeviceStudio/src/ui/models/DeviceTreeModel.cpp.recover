@@ -1,0 +1,100 @@
+#include "ui/models/DeviceTreeModel.h"
+
+#include <QBrush>
+#include <QColor>
+
+namespace ds::ui {
+
+DeviceTreeModel::DeviceTreeModel(QObject* parent)
+    : QAbstractItemModel(parent) {}
+
+QModelIndex DeviceTreeModel::index(const int row, const int column,
+                                  const QModelIndex& parentIndex) const {
+    if (parentIndex.isValid() || row < 0 || row >= devices_.size()
+        || column < 0 || column >= ColumnCount) {
+        return {};
+    }
+    return createIndex(row, column);
+}
+
+QModelIndex DeviceTreeModel::parent(const QModelIndex& child) const {
+    Q_UNUSED(child)
+    return {};
+}
+
+int DeviceTreeModel::rowCount(const QModelIndex& parentIndex) const {
+    return parentIndex.isValid() ? 0 : devices_.size();
+}
+
+int DeviceTreeModel::columnCount(const QModelIndex& parentIndex) const {
+    Q_UNUSED(parentIndex)
+    return ColumnCount;
+}
+
+QVariant DeviceTreeModel::data(const QModelIndex& modelIndex, const int role) const {
+    const DeviceListEntry* entry = deviceAt(modelIndex);
+    if (!entry) {
+        return {};
+    }
+
+    if (role == Qt::DisplayRole) {
+        return modelIndex.column() == NameColumn
+            ? QVariant(entry->displayName)
+            : QVariant(domain::toString(entry->state));
+    }
+    if (role == Qt::ForegroundRole && modelIndex.column() == StateColumn) {
+        return QBrush(entry->state == domain::DeviceState::Online
+                          ? QColor(QStringLiteral("#2e7d32"))
+                          : QColor(QStringLiteral("#757575")));
+    }
+    if (role == DeviceIdRole) {
+        return entry->id.value;
+    }
+    if (role == HostRole) {
+        return entry->endpoint.host;
+    }
+    if (role == PortRole) {
+        return entry->endpoint.port;
+    }
+    if (role == StateRole) {
+        return static_cast<int>(entry->state);
+    }
+    return {};
+}
+
+QVariant DeviceTreeModel::headerData(const int section,
+                                    const Qt::Orientation orientation,
+                                    const int role) const {
+    if (orientation != Qt::Horizontal || role != Qt::DisplayRole) {
+        return {};
+    }
+    return section == NameColumn ? tr("Device") : tr("State");
+}
+
+void DeviceTreeModel::setDevices(QVector<DeviceListEntry> devices) {
+    beginResetModel();
+    devices_ = std::move(devices);
+    endResetModel();
+}
+
+void DeviceTreeModel::updateState(const domain::DeviceId& id,
+                                  const domain::DeviceState state) {
+    for (int row = 0; row < devices_.size(); ++row) {
+        if (devices_.at(row).id == id) {
+            devices_[row].state = state;
+            emit dataChanged(index(row, StateColumn), index(row, StateColumn),
+                             {Qt::DisplayRole, Qt::ForegroundRole, StateRole});
+            return;
+        }
+    }
+}
+
+const DeviceListEntry* DeviceTreeModel::deviceAt(const QModelIndex& modelIndex) const {
+    if (!modelIndex.isValid() || modelIndex.row() < 0
+        || modelIndex.row() >= devices_.size()) {
+        return nullptr;
+    }
+    return &devices_.at(modelIndex.row());
+}
+
+}  // namespace ds::ui

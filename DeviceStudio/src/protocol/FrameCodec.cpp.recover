@@ -1,0 +1,203 @@
+#include "protocol/FrameCodec.h"
+
+#include <QBuffer>
+#include <QCborMap>
+#include <QCborValue>
+#include <QDataStream>
+
+#include <array>
+#include <limits>
+
+namespace ds::protocol {
+namespace {
+
+QByteArray magicBytes() {
+    QByteArray bytes;
+    QDataStream stream(&bytes, QIODevice::WriteOnly);
+    stream.setByteOrder(QDataStream::BigEndian);
+    stream << FrameCodec::magic;
+    return bytes;
+}
+
+}  // namespace
+
+QByteArray FrameCodec::encode(const Frame& frame) {
+    if (frame.payload.size() > std::numeric_limits<quint32>::max()) {
+        return {};
+    }
+
+    // The checksum covers every header field before the checksum plus payload.
+    // It is not intended to replace TLS; it detects framing corruption and
+    // protects the decoder while recovering from a damaged stream.
+    QByteArray prefix;
+    QDataStream prefixStream(&prefix, QIODevice::WriteOnly);
+    prefixStream.setByteOrder(QDataStream::BigEndian);
+    prefixStream << magic << version << static_cast<quint16>(frame.type)
+                 << frame.flags << quint16{0} << frame.sequence
+                 << static_cast<quint32>(frame.payload.size());
+
+    const quint32 checksum = crc32(prefix + frame.payload);
+
+    QByteArray encoded = prefix;
+    QDataStream checksumStream(&encoded, QIODevice::Append);
+    checksumStream.setByteOrder(QDataStream::BigEndian);
+    checksumStream << checksum;
+    encoded.append(frame.payload);
+    return encoded;
+}
+
+quint32 FrameCodec::crc32(const QByteArray& bytes) noexcept {
+    quint32 crc = 0xFFFFFFFFU;
+    for (const char value : bytes) {
+        crc ^= static_cast<quint8>(value);
+        for (int bit = 0; bit < 8; ++bit) {
+            const quint32 mask = 0U - (crc & 1U);
+            crc = (crc >> 1U) ^ (0xEDB88320U & mask);
+        }
+    }
+    return ~crc;
+}
+
+QByteArray FrameCodec::serializeTelemetry(const domain::TelemetrySample& sample) {
+    QCborMap map;
+    map.insert(QStringLiteral("capturedAtMs"), sample.capturedAtMs);
+    map.insert(QStringLiteral("temperatureC"), sample.temperatureC);
+    map.insert(QStringLiteral("spindleRpm"), sample.spindleRpm);
+    map.insert(QStringLiteral("vibration"), sample.vibrationMmPerSecond);
+    map.insert(QStringLiteral("loadPercent"), sample.loadPercent);
+    return QCborValue(map).toCbor();
+}
+
+std::optional<domain::TelemetrySample> FrameCodec::deserializeTelemetry(
+    const QByteArray& payload, const domain::DeviceId& deviceId) {
+    QCborParserError parserError;
+    const QCborValue root = QCborValue::fromCbor(payload, &parserError);
+    if (parserError.error != QCborError::NoError || !root.isMap()) {
+        return std::nullopt;
+    }
+
+    const QCborMap map = root.toMap();
+    const auto captured = map.value(QStringLiteral("capturedAtMs"));
+    const auto temperature = map.value(QStringLiteral("temperatureC"));
+    const auto rpm = map.value(QStringLiteral("spindleRpm"));
+    const auto vibration = map.value(QStringLiteral("vibration"));
+    const auto load = map.value(QStringLiteral("loadPercent"));
+
+    if (!captured.isInteger() || !temperature.isDouble() || !rpm.isDouble()
+        || !vibration.isDouble() || !load.isDouble()) {
+        return std::nullopt;
+    }
+
+    return domain::TelemetrySample{
+        deviceId,
+        captured.toInteger(),
+        temperature.toDouble(),
+        rpm.toDouble(),
+        vibration.toDouble(),
+        load.toDouble()};
+}
+
+FrameDecoder::FrameDecoder(const qsizetype maximumFrameBytes)
+    : maximumFrameBytes_(qMax(maximumFrameBytes, FrameCodec::headerBytes)) {}
+
+DecodeBatch FrameDecoder::append(const QByteArray& bytes) {
+    DecodeBatch batch;
+    buffer_.append(bytes);
+
+    while (buffer_.size() >= FrameCodec::headerBytes) {
+        const qsizetype magicPosition = findMagic();
+        if (magicPosition != 0) {
+            if (magicPosition < 0) {
+                // Keep the final three bytes because they may be the beginning
+                // of the four-byte magic sequence split across TCP reads.
+                const qsizetype discardCount = qMax<qsizetype>(0, buffer_.size() - 3);
+                if (discardCount > 0) {
+                    buffer_.remove(0, discardCount);
+                    batch.errors.push_back({
+                        DecodeErrorCode::GarbageDiscarded,
+                        QStringLiteral("Discarded %1 bytes while searching for frame magic")
+                            .arg(discardCount)});
+                }
+                break;
+            }
+
+            buffer_.remove(0, magicPosition);
+            batch.errors.push_back({
+                DecodeErrorCode::GarbageDiscarded,
+                QStringLiteral("Discarded %1 bytes before frame magic").arg(magicPosition)});
+        }
+
+        if (buffer_.size() < FrameCodec::headerBytes) {
+            break;
+        }
+
+        QBuffer headerBuffer(&buffer_);
+        headerBuffer.open(QIODevice::ReadOnly);
+        QDataStream stream(&headerBuffer);
+        stream.setByteOrder(QDataStream::BigEndian);
+
+        quint32 decodedMagic{};
+        quint16 decodedVersion{};
+        quint16 rawType{};
+        quint16 flags{};
+        quint16 reserved{};
+        quint32 sequence{};
+        quint32 payloadSize{};
+        quint32 checksum{};
+        stream >> decodedMagic >> decodedVersion >> rawType >> flags >> reserved
+               >> sequence >> payloadSize >> checksum;
+        Q_UNUSED(decodedMagic)
+        Q_UNUSED(reserved)
+
+        if (decodedVersion != FrameCodec::version) {
+            buffer_.remove(0, 4);
+            batch.errors.push_back({
+                DecodeErrorCode::UnsupportedVersion,
+                QStringLiteral("Unsupported protocol version %1").arg(decodedVersion)});
+            continue;
+        }
+
+        const qsizetype totalBytes = FrameCodec::headerBytes
+            + static_cast<qsizetype>(payloadSize);
+        if (totalBytes > maximumFrameBytes_) {
+            buffer_.remove(0, 4);
+            batch.errors.push_back({
+                DecodeErrorCode::FrameTooLarge,
+                QStringLiteral("Frame size %1 exceeds configured maximum %2")
+                    .arg(totalBytes)
+                    .arg(maximumFrameBytes_)});
+            continue;
+        }
+
+        if (buffer_.size() < totalBytes) {
+            break;
+        }
+
+        const QByteArray payload = buffer_.mid(FrameCodec::headerBytes,
+                                               static_cast<qsizetype>(payloadSize));
+        const QByteArray checksumInput = buffer_.left(FrameCodec::checksumOffset) + payload;
+        if (FrameCodec::crc32(checksumInput) != checksum) {
+            buffer_.remove(0, totalBytes);
+            batch.errors.push_back({
+                DecodeErrorCode::ChecksumMismatch,
+                QStringLiteral("CRC32 mismatch for sequence %1").arg(sequence)});
+            continue;
+        }
+
+        batch.frames.push_back(
+            {static_cast<MessageType>(rawType), flags, sequence, payload});
+        buffer_.remove(0, totalBytes);
+    }
+
+    return batch;
+}
+
+void FrameDecoder::reset() {
+    buffer_.clear();
+}
+
+qsizetype FrameDecoder::findMagic() const {
+    return buffer_.indexOf(magicBytes());
+}
+
+}  // namespace ds::protocol

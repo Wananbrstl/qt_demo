@@ -1,0 +1,15 @@
+#pragma once
+
+namespace ds::ui::metrics {
+
+// Centralized visual metrics keep handwritten pages consistent. These values
+// are layout hints rather than fixed widget sizes, so the UI remains usable
+// with different fonts, DPI scales, and translations.
+inline constexpr int pageMargin = 12;
+inline constexpr int sectionSpacing = 10;
+inline constexpr int controlSpacing = 6;
+inline constexpr int sidebarMinimumWidth = 220;
+inline constexpr int inspectorMinimumWidth = 240;
+inline constexpr int chartMinimumHeight = 180;
+
+}  // namespace ds::ui::metrics

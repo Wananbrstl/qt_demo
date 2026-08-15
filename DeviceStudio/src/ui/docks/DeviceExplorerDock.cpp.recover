@@ -1,0 +1,114 @@
+#include "ui/docks/DeviceExplorerDock.h"
+
+#include "ui/UiMetrics.h"
+#include "ui/models/DeviceTreeModel.h"
+
+#include <QHeaderView>
+#include <QLineEdit>
+#include <QMenu>
+#include <QSortFilterProxyModel>
+#include <QTreeView>
+#include <QVBoxLayout>
+
+namespace ds::ui {
+
+DeviceExplorerDock::DeviceExplorerDock(domain::DeviceId deviceId, QWidget* parent)
+    : QDockWidget(tr("Devices"), parent), deviceId_(std::move(deviceId)) {
+    setObjectName(QStringLiteral("DeviceExplorerDock"));
+    setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea);
+    buildUi();
+}
+
+void DeviceExplorerDock::updateDeviceState(const domain::DeviceId deviceId,
+                                           const domain::DeviceState state) {
+    model_->updateState(deviceId, state);
+}
+
+void DeviceExplorerDock::buildUi() {
+    auto* container = new QWidget(this);
+    auto* layout = new QVBoxLayout(container);
+    layout->setContentsMargins(metrics::controlSpacing, metrics::controlSpacing,
+                               metrics::controlSpacing, metrics::controlSpacing);
+
+    filterEdit_ = new QLineEdit(container);
+    filterEdit_->setPlaceholderText(tr("Filter devices…"));
+    filterEdit_->setClearButtonEnabled(true);
+
+    model_ = new DeviceTreeModel(this);
+    model_->setDevices({
+        {deviceId_, tr("CNC Demo Device"), {QStringLiteral("127.0.0.1"), 45454},
+         domain::DeviceState::Disconnected}});
+
+    proxyModel_ = new QSortFilterProxyModel(this);
+    proxyModel_->setSourceModel(model_);
+    proxyModel_->setFilterCaseSensitivity(Qt::CaseInsensitive);
+    proxyModel_->setFilterKeyColumn(-1);
+
+    treeView_ = new QTreeView(container);
+    treeView_->setModel(proxyModel_);
+    treeView_->setRootIsDecorated(false);
+    treeView_->setAlternatingRowColors(true);
+    treeView_->setSelectionBehavior(QAbstractItemView::SelectRows);
+    treeView_->setContextMenuPolicy(Qt::CustomContextMenu);
+    treeView_->header()->setStretchLastSection(false);
+    treeView_->header()->setSectionResizeMode(DeviceTreeModel::NameColumn,
+                                              QHeaderView::Stretch);
+    treeView_->header()->setSectionResizeMode(DeviceTreeModel::StateColumn,
+                                              QHeaderView::ResizeToContents);
+
+    layout->addWidget(filterEdit_);
+    layout->addWidget(treeView_, 1);
+    container->setMinimumWidth(metrics::sidebarMinimumWidth);
+    setWidget(container);
+
+    connect(filterEdit_, &QLineEdit::textChanged,
+            proxyModel_, &QSortFilterProxyModel::setFilterFixedString);
+    connect(treeView_, &QTreeView::doubleClicked, this, [this](const QModelIndex&) {
+        emit openMonitorRequested(deviceId_);
+    });
+    connect(treeView_->selectionModel(), &QItemSelectionModel::currentChanged,
+            this, [this](const QModelIndex&, const QModelIndex&) {
+                const QModelIndex source = currentSourceIndex();
+                const auto* entry = model_->deviceAt(source);
+                if (entry) {
+                    emit deviceSelected(entry->id, entry->endpoint);
+                }
+            });
+    connect(treeView_, &QTreeView::customContextMenuRequested,
+            this, &DeviceExplorerDock::showContextMenu);
+}
+
+void DeviceExplorerDock::showContextMenu(const QPoint& position) {
+    const QModelIndex source = currentSourceIndex();
+    const auto* entry = model_->deviceAt(source);
+    if (!entry) {
+        return;
+    }
+
+    QMenu menu(this);
+    QAction* monitor = menu.addAction(tr("Open Monitor"));
+    QAction* history = menu.addAction(tr("Open History"));
+    QAction* protocol = menu.addAction(tr("Open Protocol Inspector"));
+    menu.addSeparator();
+    QAction* connectAction = menu.addAction(tr("Connect"));
+    QAction* disconnectAction = menu.addAction(tr("Disconnect"));
+
+    QAction* selected = menu.exec(treeView_->viewport()->mapToGlobal(position));
+    if (selected == monitor) {
+        emit openMonitorRequested(entry->id);
+    } else if (selected == history) {
+        emit openHistoryRequested(entry->id);
+    } else if (selected == protocol) {
+        emit openProtocolRequested(entry->id);
+    } else if (selected == connectAction) {
+        emit connectRequested(entry->endpoint);
+    } else if (selected == disconnectAction) {
+        emit disconnectRequested();
+    }
+}
+
+QModelIndex DeviceExplorerDock::currentSourceIndex() const {
+    return proxyModel_->mapToSource(treeView_->currentIndex());
+}
+
+}  // namespace ds::ui

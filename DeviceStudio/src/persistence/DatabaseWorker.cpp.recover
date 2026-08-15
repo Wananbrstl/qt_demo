@@ -1,0 +1,206 @@
+#include "persistence/DatabaseWorker.h"
+
+#include <QFile>
+#include <QSqlError>
+#include <QSqlQuery>
+#include <QThread>
+#include <QTimer>
+
+namespace ds::persistence {
+
+DatabaseWorker::DatabaseWorker(QObject* parent)
+    : QObject(parent),
+      connectionName_(QStringLiteral("device-studio-%1")
+                          .arg(reinterpret_cast<quintptr>(this))) {}
+
+DatabaseWorker::~DatabaseWorker() = default;
+
+void DatabaseWorker::initialize(QString databasePath) {
+    Q_ASSERT(QThread::currentThread() == thread());
+    if (initialized_) {
+        emit initialized(true, QStringLiteral("Database already initialized"));
+        return;
+    }
+
+    database_ = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connectionName_);
+    database_.setDatabaseName(std::move(databasePath));
+    if (!database_.open()) {
+        emit initialized(false, database_.lastError().text());
+        return;
+    }
+
+    QSqlQuery pragma(database_);
+    pragma.exec(QStringLiteral("PRAGMA journal_mode=WAL"));
+    pragma.exec(QStringLiteral("PRAGMA foreign_keys=ON"));
+    pragma.exec(QStringLiteral("PRAGMA busy_timeout=5000"));
+
+    QString migrationError;
+    if (!applyMigrations(&migrationError)) {
+        emit initialized(false, migrationError);
+        return;
+    }
+
+    flushTimer_ = new QTimer(this);
+    flushTimer_->setInterval(250);
+    connect(flushTimer_, &QTimer::timeout, this, &DatabaseWorker::flushTelemetry);
+    flushTimer_->start();
+    initialized_ = true;
+    emit initialized(true, QStringLiteral("SQLite database ready"));
+}
+
+void DatabaseWorker::enqueueTelemetry(domain::TelemetrySample sample) {
+    if (!initialized_) {
+        return;
+    }
+    // The queue is private to the database thread, so no mutex is needed.
+    // A hard limit prevents unbounded growth if persistent storage is failing.
+    constexpr qsizetype maximumPendingSamples = 10000;
+    if (pendingTelemetry_.size() >= maximumPendingSamples) {
+        pendingTelemetry_.removeFirst();
+        emit logMessage(QStringLiteral("database"),
+                        QStringLiteral("Telemetry queue full; oldest sample dropped"));
+    }
+    pendingTelemetry_.push_back(std::move(sample));
+}
+
+void DatabaseWorker::queryHistory(domain::HistoryQuery query) {
+    QVector<domain::TelemetrySample> samples;
+    if (!initialized_ || !query.deviceId.isValid()) {
+        emit historyReady(query, samples);
+        return;
+    }
+
+    QSqlQuery sql(database_);
+    sql.prepare(QStringLiteral(
+        "SELECT captured_at_ms, temperature, spindle_rpm, vibration, load_percent "
+        "FROM telemetry_samples "
+        "WHERE device_id = ? AND captured_at_ms BETWEEN ? AND ? "
+        "ORDER BY captured_at_ms DESC LIMIT ? OFFSET ?"));
+    sql.addBindValue(query.deviceId.value);
+    sql.addBindValue(query.fromMs);
+    sql.addBindValue(query.toMs);
+    sql.addBindValue(qBound(1, query.limit, 5000));
+    sql.addBindValue(qMax(0, query.offset));
+
+    if (!sql.exec()) {
+        emit logMessage(QStringLiteral("database"), sql.lastError().text());
+        emit historyReady(query, samples);
+        return;
+    }
+
+    while (sql.next()) {
+        samples.push_back({
+            query.deviceId,
+            sql.value(0).toLongLong(),
+            sql.value(1).toDouble(),
+            sql.value(2).toDouble(),
+            sql.value(3).toDouble(),
+            sql.value(4).toDouble()});
+    }
+    emit historyReady(query, samples);
+}
+
+void DatabaseWorker::shutdown() {
+    if (flushTimer_) {
+        flushTimer_->stop();
+    }
+    flushTelemetry();
+    if (database_.isOpen()) {
+        database_.close();
+    }
+    database_ = {};
+    QSqlDatabase::removeDatabase(connectionName_);
+    initialized_ = false;
+}
+
+void DatabaseWorker::flushTelemetry() {
+    if (!initialized_ || pendingTelemetry_.isEmpty()) {
+        return;
+    }
+
+    // Swap first so newly queued samples belong to the next transaction. The
+    // worker is single-threaded, but this also keeps the transaction body small.
+    QList<domain::TelemetrySample> batch;
+    batch.swap(pendingTelemetry_);
+
+    if (!database_.transaction()) {
+        pendingTelemetry_.append(batch);
+        emit logMessage(QStringLiteral("database"), database_.lastError().text());
+        return;
+    }
+
+    QSqlQuery ensureDevice(database_);
+    ensureDevice.prepare(QStringLiteral(
+        "INSERT OR IGNORE INTO devices(id, display_name, host, port, created_at_ms) "
+        "VALUES (?, ?, 'unknown', 1, ?)"));
+
+    QSqlQuery insert(database_);
+    insert.prepare(QStringLiteral(
+        "INSERT INTO telemetry_samples("
+        "device_id, captured_at_ms, temperature, spindle_rpm, vibration, load_percent) "
+        "VALUES (?, ?, ?, ?, ?, ?)"));
+
+    bool success = true;
+    for (const auto& sample : batch) {
+        ensureDevice.bindValue(0, sample.deviceId.value);
+        ensureDevice.bindValue(1, sample.deviceId.value);
+        ensureDevice.bindValue(2, sample.capturedAtMs);
+        success = ensureDevice.exec();
+        if (!success) {
+            break;
+        }
+
+        insert.bindValue(0, sample.deviceId.value);
+        insert.bindValue(1, sample.capturedAtMs);
+        insert.bindValue(2, sample.temperatureC);
+        insert.bindValue(3, sample.spindleRpm);
+        insert.bindValue(4, sample.vibrationMmPerSecond);
+        insert.bindValue(5, sample.loadPercent);
+        success = insert.exec();
+        if (!success) {
+            break;
+        }
+    }
+
+    if (!success || !database_.commit()) {
+        database_.rollback();
+        pendingTelemetry_ = batch + pendingTelemetry_;
+        emit logMessage(QStringLiteral("database"), insert.lastError().text());
+    }
+}
+
+bool DatabaseWorker::applyMigrations(QString* errorMessage) {
+    QFile migration(QStringLiteral(":/migrations/001_initial.sql"));
+    if (!migration.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        *errorMessage = QStringLiteral("Cannot open embedded database migration");
+        return false;
+    }
+    return executeMigrationScript(QString::fromUtf8(migration.readAll()), errorMessage);
+}
+
+bool DatabaseWorker::executeMigrationScript(const QString& script, QString* errorMessage) {
+    if (!database_.transaction()) {
+        *errorMessage = database_.lastError().text();
+        return false;
+    }
+
+    // Migration files are controlled project assets. Splitting on semicolons is
+    // acceptable for this constrained SQL dialect; production migration tools
+    // should use a real parser when scripts contain triggers or semicolons in strings.
+    const QStringList statements = script.split(';', Qt::SkipEmptyParts);
+    QSqlQuery query(database_);
+    for (const QString& statement : statements) {
+        if (!query.exec(statement.trimmed())) {
+            database_.rollback();
+            *errorMessage = query.lastError().text();
+            return false;
+        }
+    }
+    if (!database_.commit()) {
+        *errorMessage = database_.lastError().text();
+        return false;
+    }
+    return true;
+}
+
+}  // namespace ds::persistence
