@@ -1,0 +1,128 @@
+#include "application/DeviceApplicationService.h"
+
+#include "network/DeviceSession.h"
+#include "persistence/DatabaseWorker.h"
+
+#include <QDir>
+#include <QMetaObject>
+#include <QStandardPaths>
+
+namespace ds::application {
+
+DeviceApplicationService::DeviceApplicationService(QObject* parent)
+    : QObject(parent) {
+    session_ = new network::DeviceSession(deviceId_);
+    databaseWorker_ = new persistence::DatabaseWorker;
+    session_->moveToThread(&networkThread_);
+    databaseWorker_->moveToThread(&databaseThread_);
+
+    connect(&networkThread_, &QThread::finished, session_, &QObject::deleteLater);
+    connect(&databaseThread_, &QThread::finished,
+            databaseWorker_, &QObject::deleteLater);
+
+    connect(session_, &network::DeviceSession::stateChanged,
+            this, &DeviceApplicationService::stateChanged);
+    connect(session_, &network::DeviceSession::telemetryReceived,
+            this, &DeviceApplicationService::telemetryReceived);
+    connect(session_, &network::DeviceSession::telemetryReceived,
+            databaseWorker_, &persistence::DatabaseWorker::enqueueTelemetry,
+            Qt::QueuedConnection);
+    connect(session_, &network::DeviceSession::commandReplyReceived,
+            this, &DeviceApplicationService::commandReplyReceived);
+    connect(session_, &network::DeviceSession::protocolTrace,
+            this, &DeviceApplicationService::protocolTrace);
+    connect(session_, &network::DeviceSession::logMessage,
+            this, &DeviceApplicationService::logMessage);
+
+    connect(databaseWorker_, &persistence::DatabaseWorker::initialized,
+            this, &DeviceApplicationService::databaseStatusChanged);
+    connect(databaseWorker_, &persistence::DatabaseWorker::historyReady,
+            this, &DeviceApplicationService::historyReady);
+    connect(databaseWorker_, &persistence::DatabaseWorker::logMessage,
+            this, &DeviceApplicationService::logMessage);
+}
+
+DeviceApplicationService::~DeviceApplicationService() {
+    shutdown();
+}
+
+void DeviceApplicationService::start() {
+    if (started_) {
+        return;
+    }
+    started_ = true;
+    networkThread_.setObjectName(QStringLiteral("DeviceNetworkThread"));
+    databaseThread_.setObjectName(QStringLiteral("DeviceDatabaseThread"));
+    networkThread_.start();
+    databaseThread_.start();
+
+    QMetaObject::invokeMethod(session_, &network::DeviceSession::initialize,
+                              Qt::QueuedConnection);
+
+    QString dataDirectory = QStandardPaths::writableLocation(
+        QStandardPaths::AppLocalDataLocation);
+    QDir().mkpath(dataDirectory);
+    const QString databasePath = QDir(dataDirectory).filePath(QStringLiteral("device-studio.db"));
+    QMetaObject::invokeMethod(
+        databaseWorker_,
+        [worker = databaseWorker_, databasePath] { worker->initialize(databasePath); },
+        Qt::QueuedConnection);
+}
+
+void DeviceApplicationService::shutdown() {
+    if (!started_) {
+        return;
+    }
+    started_ = false;
+
+    if (networkThread_.isRunning()) {
+        QMetaObject::invokeMethod(session_, &network::DeviceSession::shutdown,
+                                  Qt::BlockingQueuedConnection);
+        networkThread_.quit();
+        networkThread_.wait(3000);
+    }
+    if (databaseThread_.isRunning()) {
+        QMetaObject::invokeMethod(databaseWorker_, &persistence::DatabaseWorker::shutdown,
+                                  Qt::BlockingQueuedConnection);
+        databaseThread_.quit();
+        databaseThread_.wait(3000);
+    }
+}
+
+void DeviceApplicationService::connectDevice(domain::DeviceEndpoint endpoint) {
+    QMetaObject::invokeMethod(
+        session_,
+        [session = session_, endpoint = std::move(endpoint)]() mutable {
+            session->connectToDevice(std::move(endpoint));
+        },
+        Qt::QueuedConnection);
+}
+
+void DeviceApplicationService::disconnectDevice() {
+    QMetaObject::invokeMethod(session_, &network::DeviceSession::disconnectFromDevice,
+                              Qt::QueuedConnection);
+}
+
+void DeviceApplicationService::sendCommand(QString command, QByteArray arguments) {
+    domain::CommandRequest request;
+    request.deviceId = deviceId_;
+    request.command = std::move(command);
+    request.arguments = std::move(arguments);
+    QMetaObject::invokeMethod(
+        session_,
+        [session = session_, request = std::move(request)]() mutable {
+            session->sendCommand(std::move(request));
+        },
+        Qt::QueuedConnection);
+}
+
+void DeviceApplicationService::requestHistory(domain::HistoryQuery query) {
+    QMetaObject::invokeMethod(
+        databaseWorker_,
+        [worker = databaseWorker_, query = std::move(query)]() mutable {
+            worker->queryHistory(std::move(query));
+        },
+        Qt::QueuedConnection);
+}
+
+}  // namespace ds::application

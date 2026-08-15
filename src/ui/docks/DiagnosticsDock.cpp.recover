@@ -1,0 +1,43 @@
+#include "ui/docks/DiagnosticsDock.h"
+
+#include <QDateTime>
+#include <QLabel>
+#include <QPlainTextEdit>
+#include <QTabWidget>
+#include <QVBoxLayout>
+
+namespace ds::ui {
+
+DiagnosticsDock::DiagnosticsDock(QWidget* parent)
+    : QDockWidget(tr("Diagnostics"), parent) {
+    setObjectName(QStringLiteral("DiagnosticsDock"));
+    setAllowedAreas(Qt::BottomDockWidgetArea | Qt::TopDockWidgetArea);
+
+    auto* tabs = new QTabWidget(this);
+    logEdit_ = new QPlainTextEdit(tabs);
+    logEdit_->setReadOnly(true);
+    logEdit_->setMaximumBlockCount(3000);
+    tabs->addTab(logEdit_, tr("Application Log"));
+
+    auto* databasePage = new QWidget(tabs);
+    auto* databaseLayout = new QVBoxLayout(databasePage);
+    databaseStatus_ = new QLabel(tr("Database not initialized"), databasePage);
+    databaseLayout->addWidget(databaseStatus_);
+    databaseLayout->addStretch(1);
+    tabs->addTab(databasePage, tr("Database"));
+    setWidget(tabs);
+}
+
+void DiagnosticsDock::appendLog(const QString& category, const QString& message) {
+    logEdit_->appendPlainText(
+        QStringLiteral("%1 [%2] %3")
+            .arg(QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss.zzz")),
+                 category, message));
+}
+
+void DiagnosticsDock::setDatabaseStatus(const bool ready, const QString& message) {
+    databaseStatus_->setText(QStringLiteral("%1: %2")
+                                 .arg(ready ? tr("Ready") : tr("Error"), message));
+}
+
+}  // namespace ds::ui

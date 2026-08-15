@@ -1,0 +1,20 @@
+{
+  "device": {
+    "id": "cnc-demo-01",
+    "name": "CNC Demo Device",
+    "host": "127.0.0.1",
+    "port": 45454
+  },
+  "network": {
+    "heartbeatIntervalMs": 2000,
+    "heartbeatTimeoutMs": 6000,
+    "reconnectInitialMs": 500,
+    "reconnectMaximumMs": 15000,
+    "maximumFrameBytes": 1048576
+  },
+  "storage": {
+    "telemetryBatchIntervalMs": 250,
+    "telemetryRetentionDays": 30
+  }
+}
+

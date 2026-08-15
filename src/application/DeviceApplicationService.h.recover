@@ -1,0 +1,57 @@
+#pragma once
+
+#include "domain/Types.h"
+#include "protocol/FrameCodec.h"
+
+#include <QObject>
+#include <QThread>
+
+namespace ds::network {
+class DeviceSession;
+}
+
+namespace ds::persistence {
+class DatabaseWorker;
+}
+
+namespace ds::application {
+
+// This service is the UI-facing facade. It keeps QThread and worker details out
+// of widgets and translates UI intentions into queued worker operations.
+class DeviceApplicationService final : public QObject {
+    Q_OBJECT
+
+public:
+    explicit DeviceApplicationService(QObject* parent = nullptr);
+    ~DeviceApplicationService() override;
+
+    [[nodiscard]] domain::DeviceId deviceId() const { return deviceId_; }
+    void start();
+    void shutdown();
+
+public slots:
+    void connectDevice(domain::DeviceEndpoint endpoint);
+    void disconnectDevice();
+    void sendCommand(QString command, QByteArray arguments = {});
+    void requestHistory(domain::HistoryQuery query);
+
+signals:
+    void stateChanged(ds::domain::DeviceId deviceId, ds::domain::DeviceState state);
+    void telemetryReceived(ds::domain::TelemetrySample sample);
+    void commandReplyReceived(ds::domain::CommandReply reply);
+    void historyReady(ds::domain::HistoryQuery query,
+                      QVector<ds::domain::TelemetrySample> samples);
+    void protocolTrace(QString direction, ds::protocol::Frame frame);
+    void logMessage(QString category, QString message);
+    void databaseStatusChanged(bool ready, QString message);
+
+private:
+    domain::DeviceId deviceId_{QStringLiteral("cnc-demo-01")};
+    QThread networkThread_;
+    QThread databaseThread_;
+    network::DeviceSession* session_{};
+    persistence::DatabaseWorker* databaseWorker_{};
+    bool started_{};
+};
+
+}  // namespace ds::application

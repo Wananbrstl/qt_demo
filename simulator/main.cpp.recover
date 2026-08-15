@@ -1,0 +1,30 @@
+#include "simulator/DeviceSimulator.h"
+
+#include <QCommandLineParser>
+#include <QCoreApplication>
+
+int main(int argc, char* argv[]) {
+    QCoreApplication application(argc, argv);
+    QCoreApplication::setApplicationName(QStringLiteral("DeviceSimulator"));
+
+    QCommandLineParser parser;
+    parser.setApplicationDescription(QStringLiteral("DeviceStudio TCP device simulator"));
+    parser.addHelpOption();
+    QCommandLineOption portOption({QStringLiteral("p"), QStringLiteral("port")},
+                                  QStringLiteral("TCP listen port"),
+                                  QStringLiteral("port"), QStringLiteral("45454"));
+    parser.addOption(portOption);
+    parser.process(application);
+
+    bool validPort = false;
+    const int portValue = parser.value(portOption).toInt(&validPort);
+    if (!validPort || portValue < 1 || portValue > 65535) {
+        parser.showHelp(2);
+    }
+
+    ds::simulator::DeviceSimulator simulator;
+    if (!simulator.listen(static_cast<quint16>(portValue))) {
+        return 1;
+    }
+    return application.exec();
+}

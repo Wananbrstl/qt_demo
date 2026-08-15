@@ -1,0 +1,76 @@
+#include "protocol/FrameCodec.h"
+
+#include <QTest>
+
+using namespace ds::protocol;
+
+class ProtocolTest final : public QObject {
+    Q_OBJECT
+
+private slots:
+    void roundTripFrame();
+    void handlesEveryFragmentBoundary();
+    void handlesCoalescedFrames();
+    void rejectsCorruptedChecksum();
+    void telemetryRoundTrip();
+};
+
+void ProtocolTest::roundTripFrame() {
+    const Frame source{MessageType::Heartbeat, 7, 42, QByteArrayLiteral("payload")};
+    FrameDecoder decoder;
+    const DecodeBatch batch = decoder.append(FrameCodec::encode(source));
+    QCOMPARE(batch.errors.size(), 0);
+    QCOMPARE(batch.frames.size(), 1);
+    QCOMPARE(batch.frames.front().type, source.type);
+    QCOMPARE(batch.frames.front().flags, source.flags);
+    QCOMPARE(batch.frames.front().sequence, source.sequence);
+    QCOMPARE(batch.frames.front().payload, source.payload);
+}
+
+void ProtocolTest::handlesEveryFragmentBoundary() {
+    const QByteArray encoded = FrameCodec::encode(
+        {MessageType::CommandRequest, 0, 100, QByteArrayLiteral("abcdef")});
+    for (qsizetype split = 1; split < encoded.size(); ++split) {
+        FrameDecoder decoder;
+        const DecodeBatch first = decoder.append(encoded.left(split));
+        QVERIFY(first.frames.isEmpty());
+        const DecodeBatch second = decoder.append(encoded.mid(split));
+        QCOMPARE(second.frames.size(), 1);
+        QCOMPARE(second.frames.front().sequence, quint32{100});
+    }
+}
+
+void ProtocolTest::handlesCoalescedFrames() {
+    const QByteArray bytes = FrameCodec::encode({MessageType::Heartbeat, 0, 1, {}})
+        + FrameCodec::encode({MessageType::HeartbeatAck, 0, 2, {}});
+    FrameDecoder decoder;
+    const DecodeBatch batch = decoder.append(bytes);
+    QCOMPARE(batch.frames.size(), 2);
+    QCOMPARE(batch.frames.at(0).type, MessageType::Heartbeat);
+    QCOMPARE(batch.frames.at(1).type, MessageType::HeartbeatAck);
+}
+
+void ProtocolTest::rejectsCorruptedChecksum() {
+    QByteArray bytes = FrameCodec::encode(
+        {MessageType::Telemetry, 0, 7, QByteArrayLiteral("payload")});
+    bytes[FrameCodec::headerBytes] ^= char{0x01};
+    FrameDecoder decoder;
+    const DecodeBatch batch = decoder.append(bytes);
+    QVERIFY(batch.frames.isEmpty());
+    QCOMPARE(batch.errors.size(), 1);
+    QCOMPARE(batch.errors.front().code, DecodeErrorCode::ChecksumMismatch);
+}
+
+void ProtocolTest::telemetryRoundTrip() {
+    const ds::domain::DeviceId id{QStringLiteral("device-1")};
+    const ds::domain::TelemetrySample source{id, 1234567, 42.5, 2400.0, 1.25, 63.0};
+    const auto decoded = FrameCodec::deserializeTelemetry(
+        FrameCodec::serializeTelemetry(source), id);
+    QVERIFY(decoded.has_value());
+    QCOMPARE(decoded->capturedAtMs, source.capturedAtMs);
+    QCOMPARE(decoded->temperatureC, source.temperatureC);
+    QCOMPARE(decoded->spindleRpm, source.spindleRpm);
+}
+
+QTEST_MAIN(ProtocolTest)
+#include "test_protocol.moc"

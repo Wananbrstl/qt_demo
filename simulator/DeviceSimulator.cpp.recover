@@ -1,0 +1,153 @@
+#include "simulator/DeviceSimulator.h"
+
+#include "domain/Types.h"
+
+#include <QCborMap>
+#include <QCborValue>
+#include <QDateTime>
+#include <QDebug>
+#include <QTcpServer>
+#include <QTcpSocket>
+#include <QTimer>
+#include <QtAlgorithms>
+
+#include <cmath>
+
+namespace ds::simulator {
+
+DeviceSimulator::DeviceSimulator(QObject* parent)
+    : QObject(parent),
+      server_(new QTcpServer(this)),
+      telemetryTimer_(new QTimer(this)) {
+    telemetryTimer_->setInterval(100);
+    connect(server_, &QTcpServer::newConnection,
+            this, &DeviceSimulator::acceptConnections);
+    connect(telemetryTimer_, &QTimer::timeout,
+            this, &DeviceSimulator::broadcastTelemetry);
+}
+
+DeviceSimulator::~DeviceSimulator() {
+    qDeleteAll(clients_);
+}
+
+bool DeviceSimulator::listen(const quint16 port) {
+    if (!server_->listen(QHostAddress::LocalHost, port)) {
+        qCritical() << "Cannot listen:" << server_->errorString();
+        return false;
+    }
+    telemetryTimer_->start();
+    qInfo() << "Device simulator listening on" << server_->serverAddress()
+            << server_->serverPort();
+    return true;
+}
+
+void DeviceSimulator::acceptConnections() {
+    while (server_->hasPendingConnections()) {
+        QTcpSocket* socket = server_->nextPendingConnection();
+        auto* context = new ClientContext;
+        clients_.insert(socket, context);
+        connect(socket, &QTcpSocket::readyRead, this, &DeviceSimulator::readClient);
+        connect(socket, &QTcpSocket::disconnected, this, &DeviceSimulator::removeClient);
+        qInfo() << "Client connected from" << socket->peerAddress() << socket->peerPort();
+    }
+}
+
+void DeviceSimulator::readClient() {
+    auto* socket = qobject_cast<QTcpSocket*>(sender());
+    ClientContext* context = clients_.value(socket, nullptr);
+    if (!socket || !context) {
+        return;
+    }
+
+    const protocol::DecodeBatch batch = context->decoder.append(socket->readAll());
+    for (const auto& error : batch.errors) {
+        qWarning() << "Protocol error:" << error.message;
+    }
+    for (const auto& frame : batch.frames) {
+        handleFrame(socket, context, frame);
+    }
+}
+
+void DeviceSimulator::removeClient() {
+    auto* socket = qobject_cast<QTcpSocket*>(sender());
+    delete clients_.take(socket);
+    socket->deleteLater();
+    qInfo() << "Client disconnected";
+}
+
+void DeviceSimulator::broadcastTelemetry() {
+    if (clients_.isEmpty()) {
+        return;
+    }
+
+    phase_ += 0.08;
+    const double rpmBase = spindleRunning_ ? 2400.0 : 0.0;
+    domain::TelemetrySample sample{
+        {QStringLiteral("cnc-demo-01")},
+        QDateTime::currentMSecsSinceEpoch(),
+        42.0 + 4.5 * std::sin(phase_),
+        rpmBase + (spindleRunning_ ? 35.0 * std::sin(phase_ * 1.7) : 0.0),
+        1.2 + 0.35 * std::sin(phase_ * 2.3),
+        spindleRunning_ ? 58.0 + 12.0 * std::sin(phase_ * 0.7) : 4.0};
+    const QByteArray payload = protocol::FrameCodec::serializeTelemetry(sample);
+
+    for (auto iterator = clients_.begin(); iterator != clients_.end(); ++iterator) {
+        sendFrame(iterator.key(), iterator.value(), protocol::MessageType::Telemetry, payload);
+    }
+}
+
+void DeviceSimulator::handleFrame(QTcpSocket* socket, ClientContext* context,
+                                  const protocol::Frame& frame) {
+    switch (frame.type) {
+    case protocol::MessageType::Hello: {
+        QCborMap reply;
+        reply.insert(QStringLiteral("deviceId"), QStringLiteral("cnc-demo-01"));
+        reply.insert(QStringLiteral("model"), QStringLiteral("CNC-SIM-100"));
+        sendFrame(socket, context, protocol::MessageType::HelloAck,
+                  QCborValue(reply).toCbor());
+        break;
+    }
+    case protocol::MessageType::Heartbeat:
+        sendFrame(socket, context, protocol::MessageType::HeartbeatAck, frame.payload);
+        break;
+    case protocol::MessageType::CommandRequest: {
+        const QCborMap command = QCborValue::fromCbor(frame.payload).toMap();
+        const QString commandName = command.value(QStringLiteral("command")).toString();
+        bool accepted = true;
+        QString message;
+        if (commandName == QStringLiteral("start_spindle")) {
+            spindleRunning_ = true;
+            message = QStringLiteral("Spindle started");
+        } else if (commandName == QStringLiteral("stop_spindle")) {
+            spindleRunning_ = false;
+            message = QStringLiteral("Spindle stopped");
+        } else {
+            accepted = false;
+            message = QStringLiteral("Unknown command");
+        }
+
+        QCborMap reply;
+        reply.insert(QStringLiteral("requestId"),
+                     command.value(QStringLiteral("requestId")).toString());
+        reply.insert(QStringLiteral("accepted"), accepted);
+        reply.insert(QStringLiteral("message"), message);
+        sendFrame(socket, context, protocol::MessageType::CommandReply,
+                  QCborValue(reply).toCbor());
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+void DeviceSimulator::sendFrame(QTcpSocket* socket, ClientContext* context,
+                                const protocol::MessageType type,
+                                const QByteArray& payload) {
+    if (!socket || socket->state() != QAbstractSocket::ConnectedState) {
+        return;
+    }
+    socket->write(protocol::FrameCodec::encode(
+        {type, 0, context->nextSequence++, payload}));
+}
+
+}  // namespace ds::simulator

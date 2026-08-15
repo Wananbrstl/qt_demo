@@ -1,0 +1,69 @@
+#include "ui/widgets/TelemetryChartWidget.h"
+
+#include "ui/UiMetrics.h"
+
+#include <QPainter>
+#include <QPainterPath>
+#include <QSizePolicy>
+
+#include <algorithm>
+
+namespace ds::ui {
+
+TelemetryChartWidget::TelemetryChartWidget(QWidget* parent)
+    : QWidget(parent) {
+    setMinimumHeight(metrics::chartMinimumHeight);
+    setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+}
+
+void TelemetryChartWidget::appendTemperature(const double value) {
+    constexpr qsizetype maximumPoints = 180;
+    temperatures_.push_back(value);
+    if (temperatures_.size() > maximumPoints) {
+        temperatures_.remove(0, temperatures_.size() - maximumPoints);
+    }
+    update();
+}
+
+void TelemetryChartWidget::paintEvent(QPaintEvent* event) {
+    Q_UNUSED(event)
+    QPainter painter(this);
+    painter.setRenderHint(QPainter::Antialiasing);
+    painter.fillRect(rect(), palette().base());
+
+    const QRectF plot = rect().adjusted(42, 12, -12, -28);
+    painter.setPen(QPen(palette().mid().color(), 1));
+    painter.drawRect(plot);
+    painter.drawText(QRectF(4, plot.top(), 34, 20), Qt::AlignRight,
+                     QStringLiteral("100"));
+    painter.drawText(QRectF(4, plot.bottom() - 20, 34, 20), Qt::AlignRight,
+                     QStringLiteral("0"));
+
+    if (temperatures_.size() < 2) {
+        painter.drawText(plot, Qt::AlignCenter, tr("Waiting for telemetry…"));
+        return;
+    }
+
+    QPainterPath path;
+    const double denominator = static_cast<double>(temperatures_.size() - 1);
+    for (qsizetype i = 0; i < temperatures_.size(); ++i) {
+        const double x = plot.left() + plot.width() * static_cast<double>(i) / denominator;
+        const double normalized = std::clamp(temperatures_.at(i), 0.0, 100.0) / 100.0;
+        const double y = plot.bottom() - normalized * plot.height();
+        if (i == 0) {
+            path.moveTo(x, y);
+        } else {
+            path.lineTo(x, y);
+        }
+    }
+    painter.setPen(QPen(QColor(QStringLiteral("#1976d2")), 2));
+    painter.drawPath(path);
+    painter.drawText(QRectF(plot.left(), plot.bottom() + 4, plot.width(), 20),
+                     Qt::AlignCenter, tr("Temperature history"));
+}
+
+QSize TelemetryChartWidget::sizeHint() const {
+    return {640, 220};
+}
+
+}  // namespace ds::ui

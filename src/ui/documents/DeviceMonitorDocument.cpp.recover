@@ -1,0 +1,153 @@
+#include "ui/documents/DeviceMonitorDocument.h"
+
+#include "application/DeviceApplicationService.h"
+#include "ui/UiMetrics.h"
+#include "ui/models/TelemetryTableModel.h"
+#include "ui/widgets/TelemetryChartWidget.h"
+
+#include <QFormLayout>
+#include <QFrame>
+#include <QGridLayout>
+#include <QGroupBox>
+#include <QHeaderView>
+#include <QLabel>
+#include <QPushButton>
+#include <QSplitter>
+#include <QTableView>
+#include <QVBoxLayout>
+
+namespace ds::ui {
+
+DeviceMonitorDocument::DeviceMonitorDocument(
+    domain::DeviceId deviceId,
+    application::DeviceApplicationService* service,
+    QWidget* parent)
+    : QWidget(parent), deviceId_(std::move(deviceId)), service_(service) {
+    setWindowTitle(tr("Monitor — %1").arg(deviceId_.value));
+    buildUi();
+
+    connect(service_, &application::DeviceApplicationService::telemetryReceived,
+            this, &DeviceMonitorDocument::onTelemetry);
+    connect(service_, &application::DeviceApplicationService::stateChanged,
+            this, &DeviceMonitorDocument::onStateChanged);
+    connect(service_, &application::DeviceApplicationService::commandReplyReceived,
+            this, &DeviceMonitorDocument::onCommandReply);
+}
+
+void DeviceMonitorDocument::onTelemetry(const domain::TelemetrySample sample) {
+    if (!(sample.deviceId == deviceId_)) {
+        return;
+    }
+    temperatureValue_->setText(tr("%1 °C").arg(sample.temperatureC, 0, 'f', 1));
+    rpmValue_->setText(tr("%1 rpm").arg(sample.spindleRpm, 0, 'f', 0));
+    vibrationValue_->setText(tr("%1 mm/s").arg(sample.vibrationMmPerSecond, 0, 'f', 2));
+    loadValue_->setText(tr("%1 %").arg(sample.loadPercent, 0, 'f', 1));
+    tableModel_->appendSample(sample);
+    chart_->appendTemperature(sample.temperatureC);
+}
+
+void DeviceMonitorDocument::onStateChanged(const domain::DeviceId deviceId,
+                                           const domain::DeviceState state) {
+    if (!(deviceId == deviceId_)) {
+        return;
+    }
+    stateValue_->setText(domain::toString(state));
+    const bool online = state == domain::DeviceState::Online;
+    startButton_->setEnabled(online);
+    stopButton_->setEnabled(online);
+}
+
+void DeviceMonitorDocument::onCommandReply(const domain::CommandReply reply) {
+    commandStatus_->setText(reply.accepted
+                                ? tr("Accepted: %1").arg(reply.message)
+                                : tr("Rejected: %1").arg(reply.message));
+}
+
+void DeviceMonitorDocument::buildUi() {
+    auto* root = new QVBoxLayout(this);
+    root->setContentsMargins(metrics::pageMargin, metrics::pageMargin,
+                             metrics::pageMargin, metrics::pageMargin);
+    root->setSpacing(metrics::sectionSpacing);
+
+    auto* headerLayout = new QHBoxLayout;
+    auto* title = new QLabel(tr("Device %1").arg(deviceId_.value), this);
+    QFont titleFont = title->font();
+    titleFont.setPointSize(titleFont.pointSize() + 3);
+    titleFont.setBold(true);
+    title->setFont(titleFont);
+    stateValue_ = new QLabel(domain::toString(domain::DeviceState::Disconnected), this);
+    headerLayout->addWidget(title);
+    headerLayout->addStretch(1);
+    headerLayout->addWidget(new QLabel(tr("State:"), this));
+    headerLayout->addWidget(stateValue_);
+    root->addLayout(headerLayout);
+
+    auto* upperLayout = new QHBoxLayout;
+    upperLayout->addWidget(buildSummaryPanel(), 2);
+    upperLayout->addWidget(buildCommandPanel(), 1);
+    root->addLayout(upperLayout);
+
+    auto* splitter = new QSplitter(Qt::Vertical, this);
+    chart_ = new TelemetryChartWidget(splitter);
+    tableModel_ = new TelemetryTableModel(this);
+    tableView_ = new QTableView(splitter);
+    tableView_->setModel(tableModel_);
+    tableView_->setAlternatingRowColors(true);
+    tableView_->setSelectionBehavior(QAbstractItemView::SelectRows);
+    tableView_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    tableView_->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+    splitter->addWidget(chart_);
+    splitter->addWidget(tableView_);
+    splitter->setStretchFactor(0, 1);
+    splitter->setStretchFactor(1, 1);
+    root->addWidget(splitter, 1);
+}
+
+QWidget* DeviceMonitorDocument::buildSummaryPanel() {
+    auto* group = new QGroupBox(tr("Live Summary"), this);
+    auto* grid = new QGridLayout(group);
+    temperatureValue_ = new QLabel(QStringLiteral("—"), group);
+    rpmValue_ = new QLabel(QStringLiteral("—"), group);
+    vibrationValue_ = new QLabel(QStringLiteral("—"), group);
+    loadValue_ = new QLabel(QStringLiteral("—"), group);
+
+    grid->addWidget(new QLabel(tr("Temperature"), group), 0, 0);
+    grid->addWidget(temperatureValue_, 0, 1);
+    grid->addWidget(new QLabel(tr("Spindle"), group), 0, 2);
+    grid->addWidget(rpmValue_, 0, 3);
+    grid->addWidget(new QLabel(tr("Vibration"), group), 1, 0);
+    grid->addWidget(vibrationValue_, 1, 1);
+    grid->addWidget(new QLabel(tr("Load"), group), 1, 2);
+    grid->addWidget(loadValue_, 1, 3);
+    grid->setColumnStretch(1, 1);
+    grid->setColumnStretch(3, 1);
+    return group;
+}
+
+QWidget* DeviceMonitorDocument::buildCommandPanel() {
+    auto* group = new QGroupBox(tr("Commands"), this);
+    auto* layout = new QVBoxLayout(group);
+    startButton_ = new QPushButton(tr("Start Spindle"), group);
+    stopButton_ = new QPushButton(tr("Stop Spindle"), group);
+    commandStatus_ = new QLabel(tr("No command sent"), group);
+    commandStatus_->setWordWrap(true);
+    startButton_->setEnabled(false);
+    stopButton_->setEnabled(false);
+
+    layout->addWidget(startButton_);
+    layout->addWidget(stopButton_);
+    layout->addWidget(commandStatus_);
+    layout->addStretch(1);
+
+    connect(startButton_, &QPushButton::clicked, this, [this] {
+        commandStatus_->setText(tr("Start command pending…"));
+        service_->sendCommand(QStringLiteral("start_spindle"));
+    });
+    connect(stopButton_, &QPushButton::clicked, this, [this] {
+        commandStatus_->setText(tr("Stop command pending…"));
+        service_->sendCommand(QStringLiteral("stop_spindle"));
+    });
+    return group;
+}
+
+}  // namespace ds::ui

@@ -1,0 +1,25 @@
+#pragma once
+
+#include <QDockWidget>
+
+class QLabel;
+class QPlainTextEdit;
+
+namespace ds::ui {
+
+class DiagnosticsDock final : public QDockWidget {
+    Q_OBJECT
+
+public:
+    explicit DiagnosticsDock(QWidget* parent = nullptr);
+
+public slots:
+    void appendLog(const QString& category, const QString& message);
+    void setDatabaseStatus(bool ready, const QString& message);
+
+private:
+    QPlainTextEdit* logEdit_{};
+    QLabel* databaseStatus_{};
+};
+
+}  // namespace ds::ui

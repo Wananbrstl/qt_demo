@@ -1,0 +1,49 @@
+#pragma once
+
+#include "domain/Types.h"
+
+#include <QList>
+#include <QObject>
+#include <QSqlDatabase>
+
+class QTimer;
+
+namespace ds::persistence {
+
+// DatabaseWorker is a serialized gateway to SQLite. Its QSqlDatabase connection
+// is created, used, and removed in the database thread only.
+class DatabaseWorker final : public QObject {
+    Q_OBJECT
+
+public:
+    explicit DatabaseWorker(QObject* parent = nullptr);
+    ~DatabaseWorker() override;
+
+public slots:
+    void initialize(QString databasePath);
+    void enqueueTelemetry(ds::domain::TelemetrySample sample);
+    void queryHistory(ds::domain::HistoryQuery query);
+    void shutdown();
+
+signals:
+    void initialized(bool success, QString message);
+    void historyReady(ds::domain::HistoryQuery query,
+                      QVector<ds::domain::TelemetrySample> samples);
+    void logMessage(QString category, QString message);
+
+private slots:
+    void flushTelemetry();
+
+private:
+    [[nodiscard]] bool applyMigrations(QString* errorMessage);
+    [[nodiscard]] bool executeMigrationScript(const QString& script,
+                                              QString* errorMessage);
+
+    QString connectionName_;
+    QSqlDatabase database_;
+    QTimer* flushTimer_{};
+    QList<domain::TelemetrySample> pendingTelemetry_;
+    bool initialized_{};
+};
+
+}  // namespace ds::persistence

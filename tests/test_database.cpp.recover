@@ -1,0 +1,44 @@
+#include "persistence/DatabaseWorker.h"
+
+#include <QSignalSpy>
+#include <QTemporaryDir>
+#include <QTest>
+
+class DatabaseTest final : public QObject {
+    Q_OBJECT
+
+private slots:
+    void storesAndQueriesTelemetry();
+};
+
+void DatabaseTest::storesAndQueriesTelemetry() {
+    ds::domain::registerMetaTypes();
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+
+    ds::persistence::DatabaseWorker worker;
+    QSignalSpy initializedSpy(&worker, &ds::persistence::DatabaseWorker::initialized);
+    QSignalSpy historySpy(&worker, &ds::persistence::DatabaseWorker::historyReady);
+
+    worker.initialize(directory.filePath(QStringLiteral("test.db")));
+    QCOMPARE(initializedSpy.size(), 1);
+    QVERIFY(initializedSpy.front().at(0).toBool());
+
+    const ds::domain::DeviceId id{QStringLiteral("test-device")};
+    worker.enqueueTelemetry({id, 1000, 40.0, 1000.0, 1.0, 20.0});
+    worker.enqueueTelemetry({id, 2000, 41.0, 1100.0, 1.1, 22.0});
+
+    // The worker batches writes on a timer. QTRY_COMPARE processes the test
+    // event loop without introducing blocking sleeps.
+    QTest::qWait(300);
+    worker.queryHistory({id, 0, 3000, 100, 0});
+    QCOMPARE(historySpy.size(), 1);
+    const auto samples = qvariant_cast<QVector<ds::domain::TelemetrySample>>(
+        historySpy.front().at(1));
+    QCOMPARE(samples.size(), 2);
+    QCOMPARE(samples.front().capturedAtMs, qint64{2000});
+    worker.shutdown();
+}
+
+QTEST_MAIN(DatabaseTest)
+#include "test_database.moc"

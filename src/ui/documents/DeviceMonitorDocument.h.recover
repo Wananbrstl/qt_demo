@@ -1,0 +1,53 @@
+#pragma once
+
+#include "domain/Types.h"
+
+#include <QWidget>
+
+class QLabel;
+class QPushButton;
+class QTableView;
+
+namespace ds::application {
+class DeviceApplicationService;
+}
+
+namespace ds::ui {
+
+class TelemetryChartWidget;
+class TelemetryTableModel;
+
+class DeviceMonitorDocument final : public QWidget {
+    Q_OBJECT
+
+public:
+    DeviceMonitorDocument(domain::DeviceId deviceId,
+                          application::DeviceApplicationService* service,
+                          QWidget* parent = nullptr);
+
+private slots:
+    void onTelemetry(domain::TelemetrySample sample);
+    void onStateChanged(domain::DeviceId deviceId, domain::DeviceState state);
+    void onCommandReply(domain::CommandReply reply);
+
+private:
+    void buildUi();
+    QWidget* buildSummaryPanel();
+    QWidget* buildCommandPanel();
+
+    domain::DeviceId deviceId_;
+    application::DeviceApplicationService* service_{};
+    QLabel* stateValue_{};
+    QLabel* temperatureValue_{};
+    QLabel* rpmValue_{};
+    QLabel* vibrationValue_{};
+    QLabel* loadValue_{};
+    QLabel* commandStatus_{};
+    TelemetryChartWidget* chart_{};
+    TelemetryTableModel* tableModel_{};
+    QTableView* tableView_{};
+    QPushButton* startButton_{};
+    QPushButton* stopButton_{};
+};
+
+}  // namespace ds::ui

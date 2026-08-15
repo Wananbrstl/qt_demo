@@ -1,0 +1,32 @@
+#pragma once
+
+#include "domain/Types.h"
+#include "protocol/FrameCodec.h"
+
+#include <QWidget>
+
+class QPlainTextEdit;
+
+namespace ds::application {
+class DeviceApplicationService;
+}
+
+namespace ds::ui {
+
+class ProtocolInspectorDocument final : public QWidget {
+    Q_OBJECT
+
+public:
+    ProtocolInspectorDocument(domain::DeviceId deviceId,
+                              application::DeviceApplicationService* service,
+                              QWidget* parent = nullptr);
+
+private slots:
+    void appendFrame(const QString& direction, const protocol::Frame& frame);
+
+private:
+    domain::DeviceId deviceId_;
+    QPlainTextEdit* output_{};
+};
+
+}  // namespace ds::ui

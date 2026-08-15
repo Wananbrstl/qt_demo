@@ -1,0 +1,84 @@
+#include "ui/models/TelemetryTableModel.h"
+
+#include <QDateTime>
+
+namespace ds::ui {
+
+TelemetryTableModel::TelemetryTableModel(QObject* parent)
+    : QAbstractTableModel(parent) {}
+
+int TelemetryTableModel::rowCount(const QModelIndex& parent) const {
+    return parent.isValid() ? 0 : samples_.size();
+}
+
+int TelemetryTableModel::columnCount(const QModelIndex& parent) const {
+    Q_UNUSED(parent)
+    return ColumnCount;
+}
+
+QVariant TelemetryTableModel::data(const QModelIndex& index, const int role) const {
+    if (!index.isValid() || index.row() >= samples_.size()
+        || role != Qt::DisplayRole) {
+        return {};
+    }
+    const auto& sample = samples_.at(index.row());
+    switch (index.column()) {
+    case TimeColumn:
+        return QDateTime::fromMSecsSinceEpoch(sample.capturedAtMs)
+            .toString(QStringLiteral("HH:mm:ss.zzz"));
+    case TemperatureColumn:
+        return QString::number(sample.temperatureC, 'f', 1);
+    case RpmColumn:
+        return QString::number(sample.spindleRpm, 'f', 0);
+    case VibrationColumn:
+        return QString::number(sample.vibrationMmPerSecond, 'f', 2);
+    case LoadColumn:
+        return QString::number(sample.loadPercent, 'f', 1);
+    default:
+        return {};
+    }
+}
+
+QVariant TelemetryTableModel::headerData(const int section,
+                                        const Qt::Orientation orientation,
+                                        const int role) const {
+    if (orientation != Qt::Horizontal || role != Qt::DisplayRole) {
+        return {};
+    }
+    switch (section) {
+    case TimeColumn:
+        return tr("Time");
+    case TemperatureColumn:
+        return tr("Temperature °C");
+    case RpmColumn:
+        return tr("Spindle RPM");
+    case VibrationColumn:
+        return tr("Vibration mm/s");
+    case LoadColumn:
+        return tr("Load %");
+    default:
+        return {};
+    }
+}
+
+void TelemetryTableModel::appendSample(domain::TelemetrySample sample) {
+    // Newest-first ordering is convenient for an operations console. Keeping a
+    // bounded window also prevents an always-open document from consuming memory.
+    beginInsertRows({}, 0, 0);
+    samples_.prepend(std::move(sample));
+    endInsertRows();
+
+    if (samples_.size() > maximumLiveRows) {
+        beginRemoveRows({}, maximumLiveRows, samples_.size() - 1);
+        samples_.resize(maximumLiveRows);
+        endRemoveRows();
+    }
+}
+
+void TelemetryTableModel::setSamples(QVector<domain::TelemetrySample> samples) {
+    beginResetModel();
+    samples_ = std::move(samples);
+    endResetModel();
+}
+
+}  // namespace ds::ui

@@ -1,0 +1,88 @@
+#pragma once
+
+#include "domain/Types.h"
+
+#include <QByteArray>
+#include <QString>
+#include <QVector>
+
+#include <optional>
+
+namespace ds::protocol {
+
+enum class MessageType : quint16 {
+    Hello = 1,
+    HelloAck = 2,
+    Heartbeat = 3,
+    HeartbeatAck = 4,
+    Telemetry = 10,
+    CommandRequest = 20,
+    CommandReply = 21,
+    AlarmRaised = 30,
+    AlarmCleared = 31,
+    ProtocolError = 255
+};
+
+struct Frame final {
+    MessageType type{MessageType::ProtocolError};
+    quint16 flags{};
+    quint32 sequence{};
+    QByteArray payload;
+};
+
+enum class DecodeErrorCode {
+    GarbageDiscarded,
+    UnsupportedVersion,
+    FrameTooLarge,
+    ChecksumMismatch,
+    InvalidPayload
+};
+
+struct DecodeError final {
+    DecodeErrorCode code{};
+    QString message;
+};
+
+struct DecodeBatch final {
+    QVector<Frame> frames;
+    QVector<DecodeError> errors;
+};
+
+class FrameCodec final {
+public:
+    static constexpr quint32 magic = 0x44535455U;  // ASCII: DSTU
+    static constexpr quint16 version = 1;
+    static constexpr qsizetype headerBytes = 24;
+    static constexpr qsizetype checksumOffset = 20;
+
+    [[nodiscard]] static QByteArray encode(const Frame& frame);
+    [[nodiscard]] static quint32 crc32(const QByteArray& bytes) noexcept;
+
+    [[nodiscard]] static QByteArray serializeTelemetry(
+        const domain::TelemetrySample& sample);
+    [[nodiscard]] static std::optional<domain::TelemetrySample> deserializeTelemetry(
+        const QByteArray& payload, const domain::DeviceId& deviceId);
+};
+
+// QTcpSocket is a byte stream: one readyRead notification is not equivalent to
+// one application message. FrameDecoder therefore owns an accumulation buffer
+// and emits only complete, validated frames.
+class FrameDecoder final {
+public:
+    explicit FrameDecoder(qsizetype maximumFrameBytes = 1024 * 1024);
+
+    [[nodiscard]] DecodeBatch append(const QByteArray& bytes);
+    void reset();
+
+    [[nodiscard]] qsizetype bufferedBytes() const noexcept { return buffer_.size(); }
+
+private:
+    [[nodiscard]] qsizetype findMagic() const;
+
+    QByteArray buffer_;
+    qsizetype maximumFrameBytes_{};
+};
+
+}  // namespace ds::protocol
+
+Q_DECLARE_METATYPE(ds::protocol::Frame)

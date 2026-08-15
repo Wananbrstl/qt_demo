@@ -1,0 +1,25 @@
+#pragma once
+
+#include <QVector>
+#include <QWidget>
+
+namespace ds::ui {
+
+// A small custom chart intentionally avoids Qt Charts so learners can practice
+// paintEvent, coordinate transforms, high-DPI rendering, and bounded data sets.
+class TelemetryChartWidget final : public QWidget {
+    Q_OBJECT
+
+public:
+    explicit TelemetryChartWidget(QWidget* parent = nullptr);
+    void appendTemperature(double value);
+
+protected:
+    void paintEvent(QPaintEvent* event) override;
+    QSize sizeHint() const override;
+
+private:
+    QVector<double> temperatures_;
+};
+
+}  // namespace ds::ui

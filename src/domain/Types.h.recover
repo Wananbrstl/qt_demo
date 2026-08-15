@@ -1,0 +1,90 @@
+#pragma once
+
+#include <QDateTime>
+#include <QByteArray>
+#include <QHostAddress>
+#include <QMetaType>
+#include <QString>
+#include <QUuid>
+#include <QVector>
+
+namespace ds::domain {
+
+// DeviceId is deliberately a distinct value type instead of a QString alias.
+// This prevents accidentally passing a display name or host name where a stable
+// device identifier is required.
+struct DeviceId final {
+    QString value;
+
+    [[nodiscard]] bool isValid() const noexcept { return !value.trimmed().isEmpty(); }
+    friend bool operator==(const DeviceId&, const DeviceId&) = default;
+};
+
+[[nodiscard]] size_t qHash(const DeviceId& id, size_t seed = 0) noexcept;
+
+struct DeviceEndpoint final {
+    QString host{"127.0.0.1"};
+    quint16 port{45454};
+
+    [[nodiscard]] bool isValid() const noexcept {
+        return !host.trimmed().isEmpty() && port != 0;
+    }
+};
+
+enum class DeviceState : quint8 {
+    Disconnected,
+    Connecting,
+    Handshaking,
+    Online,
+    Degraded,
+    Reconnecting,
+    Stopping
+};
+
+[[nodiscard]] QString toString(DeviceState state);
+
+struct TelemetrySample final {
+    DeviceId deviceId;
+    qint64 capturedAtMs{};
+    double temperatureC{};
+    double spindleRpm{};
+    double vibrationMmPerSecond{};
+    double loadPercent{};
+};
+
+struct CommandRequest final {
+    QUuid requestId{QUuid::createUuid()};
+    DeviceId deviceId;
+    QString command;
+    QByteArray arguments;
+    qint64 requestedAtMs{QDateTime::currentMSecsSinceEpoch()};
+};
+
+struct CommandReply final {
+    QUuid requestId;
+    bool accepted{};
+    QString message;
+};
+
+struct HistoryQuery final {
+    DeviceId deviceId;
+    qint64 fromMs{};
+    qint64 toMs{};
+    int limit{500};
+    int offset{};
+};
+
+// Registering custom types is required before they cross a queued signal/slot
+// boundary. The application invokes this once at the composition root.
+void registerMetaTypes();
+
+}  // namespace ds::domain
+
+Q_DECLARE_METATYPE(ds::domain::DeviceId)
+Q_DECLARE_METATYPE(ds::domain::DeviceEndpoint)
+Q_DECLARE_METATYPE(ds::domain::DeviceState)
+Q_DECLARE_METATYPE(ds::domain::TelemetrySample)
+Q_DECLARE_METATYPE(ds::domain::CommandRequest)
+Q_DECLARE_METATYPE(ds::domain::CommandReply)
+Q_DECLARE_METATYPE(ds::domain::HistoryQuery)
+Q_DECLARE_METATYPE(QVector<ds::domain::TelemetrySample>)

@@ -1,0 +1,45 @@
+#include "ui/docks/PropertyInspectorDock.h"
+
+#include "ui/UiMetrics.h"
+
+#include <QFormLayout>
+#include <QLabel>
+
+namespace ds::ui {
+
+PropertyInspectorDock::PropertyInspectorDock(QWidget* parent)
+    : QDockWidget(tr("Properties"), parent) {
+    setObjectName(QStringLiteral("PropertyInspectorDock"));
+    setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea);
+
+    auto* container = new QWidget(this);
+    auto* form = new QFormLayout(container);
+    form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+    idValue_ = new QLabel(tr("No selection"), container);
+    hostValue_ = new QLabel(QStringLiteral("—"), container);
+    portValue_ = new QLabel(QStringLiteral("—"), container);
+    stateValue_ = new QLabel(domain::toString(domain::DeviceState::Disconnected), container);
+    form->addRow(tr("Device ID:"), idValue_);
+    form->addRow(tr("Host:"), hostValue_);
+    form->addRow(tr("Port:"), portValue_);
+    form->addRow(tr("State:"), stateValue_);
+    container->setMinimumWidth(metrics::inspectorMinimumWidth);
+    setWidget(container);
+}
+
+void PropertyInspectorDock::inspectDevice(domain::DeviceId deviceId,
+                                          domain::DeviceEndpoint endpoint) {
+    inspectedId_ = std::move(deviceId);
+    idValue_->setText(inspectedId_.value);
+    hostValue_->setText(endpoint.host);
+    portValue_->setText(QString::number(endpoint.port));
+}
+
+void PropertyInspectorDock::updateState(const domain::DeviceId deviceId,
+                                        const domain::DeviceState state) {
+    if (deviceId == inspectedId_) {
+        stateValue_->setText(domain::toString(state));
+    }
+}
+
+}  // namespace ds::ui

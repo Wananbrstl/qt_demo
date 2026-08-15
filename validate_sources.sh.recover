@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd /home/wananbrstl/projects/DeviceStudio
+bad=0
+while IFS= read -r -d '' source_file; do
+    if head -c 32 "${source_file}" | grep -q '%TSD-Header'; then
+        echo "ENCRYPTED: ${source_file}"
+        bad=1
+    fi
+done < <(find src simulator tests -type f \( -name '*.h' -o -name '*.cpp' \) -print0)
+
+source_count=$(find src simulator tests -type f \( -name '*.h' -o -name '*.cpp' \) | wc -l)
+line_count=$(find src simulator tests -type f \( -name '*.h' -o -name '*.cpp' \) -print0 | xargs -0 wc -l | tail -n 1 | awk '{print $1}')
+echo "source_files=${source_count}"
+echo "source_lines=${line_count}"
+exit "${bad}"
