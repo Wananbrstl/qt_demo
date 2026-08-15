@@ -1,0 +1,79 @@
+#include "transport/BoundedWriteQueue.h"
+
+#include <QtGlobal>
+
+namespace ds::tcp {
+
+BoundedWriteQueue::BoundedWriteQueue(const int maximumItems,
+                                     const int maximumBytes)
+    : maximumItems_(qMax(1, maximumItems)),
+      maximumBytes_(qMax(1, maximumBytes)) {}
+
+EnqueueResult BoundedWriteQueue::enqueue(OutboundMessage message) {
+    const int messageBytes = message.bytes.size();
+    if (messageBytes > maximumBytes_) {
+        return EnqueueResult::RejectedByteLimit;
+    }
+
+    // Fresh telemetry supersedes queued telemetry with the same key. Commands
+    // are never silently replaced because their side effects may differ.
+    if (message.trafficClass == TrafficClass::Telemetry
+        && !message.coalescingKey.isEmpty()) {
+        for (auto& queued : messages_) {
+            if (queued.trafficClass == TrafficClass::Telemetry
+                && queued.coalescingKey == message.coalescingKey) {
+                const int candidate = bytes_ - queued.bytes.size() + messageBytes;
+                if (candidate > maximumBytes_) {
+                    return EnqueueResult::RejectedByteLimit;
+                }
+                queued = std::move(message);
+                bytes_ = candidate;
+                highWaterBytes_ = qMax(highWaterBytes_, bytes_);
+                return EnqueueResult::Coalesced;
+            }
+        }
+    }
+
+    if (messages_.size() >= maximumItems_) {
+        return EnqueueResult::RejectedItemLimit;
+    }
+    if (bytes_ + messageBytes > maximumBytes_) {
+        return EnqueueResult::RejectedByteLimit;
+    }
+    bytes_ += messageBytes;
+    highWaterBytes_ = qMax(highWaterBytes_, bytes_);
+    messages_.push_back(std::move(message));
+    return EnqueueResult::Accepted;
+}
+
+std::optional<OutboundMessage> BoundedWriteQueue::takeNext() {
+    if (messages_.isEmpty()) {
+        return std::nullopt;
+    }
+    const int index = nextIndex();
+    OutboundMessage result = messages_.takeAt(index);
+    bytes_ -= result.bytes.size();
+    return result;
+}
+
+void BoundedWriteQueue::clear() noexcept {
+    messages_.clear();
+    bytes_ = 0;
+}
+
+int BoundedWriteQueue::nextIndex() const noexcept {
+    // Control is preferred, then heartbeat. FIFO is retained within a class.
+    for (const TrafficClass trafficClass : {TrafficClass::Control,
+                                            TrafficClass::Heartbeat,
+                                            TrafficClass::Telemetry,
+                                            TrafficClass::Bulk}) {
+        for (int index = 0; index < messages_.size(); ++index) {
+            if (messages_.at(index).trafficClass == trafficClass) {
+                return index;
+            }
+        }
+    }
+    return 0;
+}
+
+}  // namespace ds::tcp

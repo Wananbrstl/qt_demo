@@ -1,0 +1,65 @@
+#include "common/TcpTypes.h"
+
+namespace ds::tcp {
+
+QString toString(const SessionState state) {
+    switch (state) {
+    case SessionState::Stopped: return QStringLiteral("Stopped");
+    case SessionState::Disconnected: return QStringLiteral("Disconnected");
+    case SessionState::Connecting: return QStringLiteral("Connecting");
+    case SessionState::Handshaking: return QStringLiteral("Handshaking");
+    case SessionState::Online: return QStringLiteral("Online");
+    case SessionState::Degraded: return QStringLiteral("Degraded");
+    case SessionState::Reconnecting: return QStringLiteral("Reconnecting");
+    case SessionState::Stopping: return QStringLiteral("Stopping");
+    }
+    return QStringLiteral("Unknown");
+}
+
+QString toString(const MessageType type) {
+    switch (type) {
+    case MessageType::Hello: return QStringLiteral("Hello");
+    case MessageType::HelloAck: return QStringLiteral("HelloAck");
+    case MessageType::Heartbeat: return QStringLiteral("Heartbeat");
+    case MessageType::HeartbeatAck: return QStringLiteral("HeartbeatAck");
+    case MessageType::Telemetry: return QStringLiteral("Telemetry");
+    case MessageType::CommandRequest: return QStringLiteral("CommandRequest");
+    case MessageType::CommandReply: return QStringLiteral("CommandReply");
+    case MessageType::ProtocolError: return QStringLiteral("ProtocolError");
+    }
+    return QStringLiteral("Unknown(%1)").arg(static_cast<quint16>(type));
+}
+
+QString SessionConfig::validate() const {
+    if (!endpoint.isValid()) {
+        return QStringLiteral("endpoint host and port must be valid");
+    }
+    if (protocol.maximumFrameBytes < 24
+        || protocol.maximumBufferedBytes < protocol.maximumFrameBytes) {
+        return QStringLiteral("protocol buffer limits are inconsistent");
+    }
+    if (connectTimeoutMs <= 0 || handshakeTimeoutMs <= 0
+        || heartbeatIntervalMs <= 0 || requestTimeoutMs <= 0) {
+        return QStringLiteral("all timeout values must be positive");
+    }
+    if (silenceTimeoutMs <= heartbeatIntervalMs) {
+        return QStringLiteral("silence timeout must exceed heartbeat interval");
+    }
+    if (reconnectBaseMs <= 0 || reconnectMaximumMs < reconnectBaseMs) {
+        return QStringLiteral("reconnect limits are inconsistent");
+    }
+    if (maximumQueuedMessages <= 0 || maximumQueuedBytes <= 0
+        || socketWriteHighWaterBytes <= 0) {
+        return QStringLiteral("queue limits must be positive");
+    }
+    return {};
+}
+
+void registerTcpMetaTypes() {
+    qRegisterMetaType<SessionState>();
+    qRegisterMetaType<TelemetrySample>();
+    qRegisterMetaType<CommandResult>();
+    qRegisterMetaType<SessionMetrics>();
+}
+
+}  // namespace ds::tcp

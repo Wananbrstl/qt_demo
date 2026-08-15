@@ -73,6 +73,8 @@ docs                 配套教程、实验与故障演练
 - `docs/network/04_industrial_tcp_advanced_zh.md`
 - `docs/database/03_sqlite_engineering_advanced_zh.md`
 
+可运行的 Qt 5.15 TCP 工业学习用例见 `examples/tcp/README_zh.md`，配套调试手册和渐进实验分别位于 `examples/tcp/DEBUGGING_zh.md` 与 `examples/tcp/LABS_zh.md`。
+
 ## 使用边界与安全
 
 本工程是工业风格的学习代码，不是经过认证的机器安全系统。将教学命令连接到可能伤害人员或设备的执行机构之前，必须补充身份认证、权限控制、TLS、安全联锁、独立急停和正式的风险分析。

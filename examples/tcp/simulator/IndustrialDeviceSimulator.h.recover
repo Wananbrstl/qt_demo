@@ -1,0 +1,62 @@
+#pragma once
+
+#include "protocol/FrameCodec.h"
+
+#include <QHash>
+#include <QObject>
+
+class QTcpServer;
+class QTcpSocket;
+class QTimer;
+
+namespace ds::tcp {
+
+struct FaultProfile final {
+    int maximumChunkBytes{};       // 0 writes each encoded frame in one call.
+    int chunkDelayMs{};
+    int corruptEveryNFrames{};    // 0 disables corruption.
+    int dropEveryNFrames{};       // Application-frame loss, not TCP packet loss.
+    int disconnectAfterNFrames{};
+    int commandReplyDelayMs{};
+};
+
+// A deterministic local device used by integration tests and manual labs. It
+// deliberately injects application-stream faults; tc/netem remains the tool for
+// packet loss, reordering, and kernel-level network behavior.
+class IndustrialDeviceSimulator final : public QObject {
+    Q_OBJECT
+
+public:
+    explicit IndustrialDeviceSimulator(QObject* parent = nullptr);
+    ~IndustrialDeviceSimulator() override;
+
+    void setFaultProfile(FaultProfile profile) noexcept { faults_ = profile; }
+    void setTelemetryIntervalMs(int intervalMs);
+    [[nodiscard]] bool listen(quint16 port = 0);
+    [[nodiscard]] quint16 serverPort() const;
+    void close();
+
+signals:
+    void logMessage(QString message);
+    void clientCountChanged(int count);
+
+private:
+    struct Peer;
+
+    void acceptConnections();
+    void removePeer(QTcpSocket* socket);
+    void readPeer(Peer* peer);
+    void handleFrame(Peer* peer, const Frame& frame);
+    void sendFrame(Peer* peer, MessageType type, QByteArray payload);
+    void queueEncodedFrame(Peer* peer, QByteArray bytes);
+    void drainNextChunk(Peer* peer);
+    void broadcastTelemetry();
+
+    QTcpServer* server_{};
+    QTimer* telemetryTimer_{};
+    QHash<QTcpSocket*, Peer*> peers_;
+    FaultProfile faults_;
+    quint64 telemetryCounter_{};
+};
+
+}  // namespace ds::tcp

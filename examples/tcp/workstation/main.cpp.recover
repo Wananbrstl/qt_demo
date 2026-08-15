@@ -1,0 +1,39 @@
+#include "common/TcpTypes.h"
+#include "common/SessionConfigLoader.h"
+#include "workstation/TcpWorkbenchWindow.h"
+
+#include <QApplication>
+#include <QCommandLineParser>
+#include <QCoreApplication>
+#include <QDebug>
+
+int main(int argc, char* argv[]) {
+    QCoreApplication::setOrganizationName(QStringLiteral("DeviceStudioLearning"));
+    QCoreApplication::setApplicationName(QStringLiteral("TcpWorkstation"));
+    QApplication application(argc, argv);
+    ds::tcp::registerTcpMetaTypes();
+
+    QCommandLineParser parser;
+    parser.setApplicationDescription(
+        QStringLiteral("Industrial TCP learning workstation for Qt 5.15"));
+    parser.addHelpOption();
+    parser.addOption({QStringLiteral("config"),
+                      QStringLiteral("JSON session configuration file"),
+                      QStringLiteral("path")});
+    parser.process(application);
+
+    ds::tcp::SessionConfig config;
+    if (parser.isSet(QStringLiteral("config"))) {
+        const auto loaded = ds::tcp::SessionConfigLoader::fromFile(
+            parser.value(QStringLiteral("config")));
+        if (!loaded.succeeded()) {
+            qCritical().noquote() << loaded.error;
+            return 2;
+        }
+        config = loaded.config;
+    }
+
+    ds::tcp::TcpWorkbenchWindow window(config);
+    window.show();
+    return application.exec();
+}

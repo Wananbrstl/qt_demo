@@ -1,0 +1,66 @@
+#pragma once
+
+#include "common/TcpTypes.h"
+
+#include <QByteArray>
+#include <QString>
+#include <QVector>
+
+namespace ds::tcp {
+
+struct Frame final {
+    MessageType type{MessageType::ProtocolError};
+    quint16 flags{};
+    quint32 sequence{};
+    QByteArray payload;
+};
+
+enum class DecodeErrorCode : quint8 {
+    GarbageDiscarded,
+    UnsupportedVersion,
+    FrameTooLarge,
+    BufferLimitExceeded,
+    ChecksumMismatch
+};
+
+struct DecodeError final {
+    DecodeErrorCode code{};
+    QString detail;
+    int discardedBytes{};
+};
+
+struct DecodeBatch final {
+    QVector<Frame> frames;
+    QVector<DecodeError> errors;
+};
+
+class FrameCodec final {
+public:
+    static constexpr quint32 magic = 0x44535443U;  // ASCII DSTC
+    static constexpr quint16 version = 1;
+    static constexpr int headerBytes = 24;
+    static constexpr int checksumOffset = 20;
+
+    [[nodiscard]] static QByteArray encode(const Frame& frame);
+    [[nodiscard]] static quint32 crc32(const QByteArray& bytes) noexcept;
+};
+
+// Incremental, socket-independent parser. append() may return zero, one, or
+// multiple frames. Every loop iteration consumes input or exits for more data.
+class StreamFrameDecoder final {
+public:
+    explicit StreamFrameDecoder(ProtocolLimits limits = {});
+
+    [[nodiscard]] DecodeBatch append(const QByteArray& bytes);
+    void reset() noexcept { buffer_.clear(); }
+    [[nodiscard]] int bufferedBytes() const noexcept { return buffer_.size(); }
+
+private:
+    [[nodiscard]] int findMagic() const;
+    void discardPrefix(int count, DecodeBatch& batch, QString reason);
+
+    ProtocolLimits limits_;
+    QByteArray buffer_;
+};
+
+}  // namespace ds::tcp

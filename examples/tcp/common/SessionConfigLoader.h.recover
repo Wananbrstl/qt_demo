@@ -1,0 +1,25 @@
+#pragma once
+
+#include "common/TcpTypes.h"
+
+#include <QByteArray>
+#include <QString>
+
+namespace ds::tcp {
+
+struct SessionConfigLoadResult final {
+    SessionConfig config;
+    QString error;
+
+    [[nodiscard]] bool succeeded() const noexcept { return error.isEmpty(); }
+};
+
+// JSON exists only at the composition boundary. The rest of the application
+// receives a validated value object and never performs stringly-typed lookup.
+class SessionConfigLoader final {
+public:
+    [[nodiscard]] static SessionConfigLoadResult fromJson(const QByteArray& json);
+    [[nodiscard]] static SessionConfigLoadResult fromFile(const QString& path);
+};
+
+}  // namespace ds::tcp

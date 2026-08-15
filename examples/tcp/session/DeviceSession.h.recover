@@ -1,0 +1,101 @@
+#pragma once
+
+#include "common/BackoffPolicy.h"
+#include "common/TcpTypes.h"
+#include "protocol/FrameCodec.h"
+#include "transport/BoundedWriteQueue.h"
+
+#include <QElapsedTimer>
+#include <QHash>
+#include <QObject>
+
+class QTcpSocket;
+class QTimer;
+
+namespace ds::tcp {
+
+// DeviceSession is a worker object. Construct it without a parent, move it to
+// the network thread, then invoke initialize(). Socket and timers are created
+// only in that thread so their affinity is correct by construction.
+class DeviceSession final : public QObject {
+    Q_OBJECT
+
+public:
+    explicit DeviceSession(SessionConfig config,
+                           quint32 randomSeed = 0xD35C0DEU,
+                           QObject* parent = nullptr);
+    ~DeviceSession() override;
+
+public slots:
+    void initialize();
+    void connectDevice();
+    void disconnectDevice();
+    void sendCommand(QUuid requestId, QString command,
+                     QByteArray arguments, bool idempotent);
+    void shutdown();
+
+signals:
+    void stateChanged(ds::tcp::SessionState state, QString reason);
+    void telemetryReceived(ds::tcp::TelemetrySample sample);
+    void commandCompleted(ds::tcp::CommandResult result);
+    void frameObserved(QString direction, ds::tcp::MessageType type,
+                       quint32 sequence, int payloadBytes);
+    void metricsChanged(ds::tcp::SessionMetrics metrics);
+    void logMessage(QString category, QString message);
+    void finished();
+
+private slots:
+    void onConnected();
+    void onDisconnected();
+    void onReadyRead();
+    void onSocketError();
+    void onHeartbeatTick();
+    void onPendingScan();
+    void pumpWriteQueue();
+
+private:
+    struct PendingRequest final {
+        qint64 deadlineMs{};
+        quint64 connectionGeneration{};
+        bool idempotent{};
+        QString command;
+    };
+
+    void startConnectionAttempt();
+    void scheduleReconnect(QString reason);
+    void transition(SessionState next, QString reason);
+    bool enqueueFrame(MessageType type, QByteArray payload,
+                      TrafficClass trafficClass,
+                      QString coalescingKey = {});
+    void handleFrame(const Frame& frame);
+    void handleHelloAck(const Frame& frame);
+    void handleTelemetry(const Frame& frame);
+    void handleCommandReply(const Frame& frame);
+    void failPending(CommandCompletion completion, const QString& detail);
+    void publishMetrics();
+
+    SessionConfig config_;
+    BackoffPolicy backoff_;
+    StreamFrameDecoder decoder_;
+    BoundedWriteQueue writeQueue_;
+
+    QTcpSocket* socket_{};
+    QTimer* connectTimeout_{};
+    QTimer* handshakeTimeout_{};
+    QTimer* heartbeatTimer_{};
+    QTimer* reconnectTimer_{};
+    QTimer* pendingTimer_{};
+    QTimer* metricsTimer_{};
+    QElapsedTimer monotonicClock_;
+
+    QHash<QUuid, PendingRequest> pending_;
+    SessionState state_{SessionState::Stopped};
+    SessionMetrics metrics_;
+    quint32 nextSequence_{1};
+    qint64 lastInboundMs_{};
+    bool initialized_{};
+    bool shutdownRequested_{};
+    bool userDisconnectRequested_{};
+};
+
+}  // namespace ds::tcp

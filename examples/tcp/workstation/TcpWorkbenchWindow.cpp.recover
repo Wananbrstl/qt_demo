@@ -1,0 +1,279 @@
+#include "workstation/TcpWorkbenchWindow.h"
+
+#include "session/DeviceSession.h"
+
+#include <QCheckBox>
+#include <QCloseEvent>
+#include <QComboBox>
+#include <QDateTime>
+#include <QDockWidget>
+#include <QFormLayout>
+#include <QGroupBox>
+#include <QHeaderView>
+#include <QLabel>
+#include <QLineEdit>
+#include <QMetaObject>
+#include <QPlainTextEdit>
+#include <QPushButton>
+#include <QStandardItemModel>
+#include <QStatusBar>
+#include <QTableView>
+#include <QVBoxLayout>
+
+#include <utility>
+
+namespace ds::tcp {
+namespace {
+
+QString completionText(const CommandCompletion completion) {
+    switch (completion) {
+    case CommandCompletion::Accepted: return QStringLiteral("Accepted");
+    case CommandCompletion::Rejected: return QStringLiteral("Rejected");
+    case CommandCompletion::TimedOutUnknown: return QStringLiteral("TimedOutUnknown");
+    case CommandCompletion::DisconnectedUnknown: return QStringLiteral("DisconnectedUnknown");
+    case CommandCompletion::QueueRejected: return QStringLiteral("QueueRejected");
+    case CommandCompletion::ProtocolFailure: return QStringLiteral("ProtocolFailure");
+    }
+    return QStringLiteral("Unknown");
+}
+
+QStandardItem* numberItem(const double value, const int precision = 2) {
+    auto* item = new QStandardItem(QString::number(value, 'f', precision));
+    item->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    return item;
+}
+
+}  // namespace
+
+TcpWorkbenchWindow::TcpWorkbenchWindow(SessionConfig config, QWidget* parent)
+    : QMainWindow(parent), config_(std::move(config)) {
+    buildUi();
+    startNetworkWorker();
+}
+
+TcpWorkbenchWindow::~TcpWorkbenchWindow() {
+    if (networkThread_.isRunning()) {
+        emit shutdownRequested();
+        if (!networkThread_.wait(3000)) {
+            // quit() is a bounded fallback, never terminate(): abrupt thread
+            // termination can leave socket callbacks and locks inconsistent.
+            networkThread_.quit();
+            networkThread_.wait(1000);
+        }
+    }
+}
+
+void TcpWorkbenchWindow::closeEvent(QCloseEvent* event) {
+    if (!shutdownStarted_) {
+        shutdownStarted_ = true;
+        setEnabled(false);
+        emit shutdownRequested();
+    }
+    event->accept();
+}
+
+void TcpWorkbenchWindow::submitCommand() {
+    const QUuid requestId = QUuid::createUuid();
+    emit commandRequested(requestId, commandBox_->currentText(),
+                          argumentsEdit_->text().toUtf8(),
+                          idempotentCheck_->isChecked());
+    appendDiagnostic(QStringLiteral("command"),
+                     QStringLiteral("submitted %1 id=%2")
+                         .arg(commandBox_->currentText(),
+                              requestId.toString(QUuid::WithoutBraces)));
+}
+
+void TcpWorkbenchWindow::onStateChanged(const SessionState state,
+                                        const QString& reason) {
+    stateValue_->setText(toString(state));
+    const bool online = state == SessionState::Online;
+    connectButton_->setEnabled(state == SessionState::Disconnected
+                               || state == SessionState::Reconnecting);
+    disconnectButton_->setEnabled(state != SessionState::Stopped
+                                  && state != SessionState::Disconnected);
+    sendButton_->setEnabled(online);
+    statusBar()->showMessage(reason, 5000);
+    appendDiagnostic(QStringLiteral("state"),
+                     QStringLiteral("%1: %2").arg(toString(state), reason));
+}
+
+void TcpWorkbenchWindow::onTelemetry(const TelemetrySample sample) {
+    QList<QStandardItem*> row;
+    row << new QStandardItem(QDateTime::fromMSecsSinceEpoch(sample.capturedAtMs)
+                                 .toString(QStringLiteral("HH:mm:ss.zzz")))
+        << new QStandardItem(sample.deviceId)
+        << numberItem(sample.temperatureC)
+        << numberItem(sample.spindleRpm, 0)
+        << numberItem(sample.vibrationMmPerSecond)
+        << numberItem(sample.loadPercent);
+    telemetryModel_->insertRow(0, row);
+    constexpr int maximumVisibleRows = 500;
+    if (telemetryModel_->rowCount() > maximumVisibleRows) {
+        telemetryModel_->removeRows(maximumVisibleRows,
+                                    telemetryModel_->rowCount() - maximumVisibleRows);
+    }
+}
+
+void TcpWorkbenchWindow::onCommandResult(const CommandResult result) {
+    appendDiagnostic(QStringLiteral("command"),
+                     QStringLiteral("%1 id=%2 generation=%3: %4")
+                         .arg(completionText(result.completion),
+                              result.requestId.toString(QUuid::WithoutBraces))
+                         .arg(result.connectionGeneration)
+                         .arg(result.detail));
+}
+
+void TcpWorkbenchWindow::onFrame(const QString direction,
+                                 const MessageType type,
+                                 const quint32 sequence,
+                                 const int payloadBytes) {
+    protocolLog_->appendPlainText(
+        QStringLiteral("%1 %2 seq=%3 payload=%4 B")
+            .arg(direction, toString(type))
+            .arg(sequence)
+            .arg(payloadBytes));
+    constexpr int maximumLogBlocks = 2000;
+    protocolLog_->document()->setMaximumBlockCount(maximumLogBlocks);
+}
+
+void TcpWorkbenchWindow::onMetrics(const SessionMetrics metrics) {
+    metricsValue_->setText(
+        QStringLiteral("gen=%1  RX=%2/%3f  TX=%4/%5f  queue=%6/%7B  "
+                       "high=%8B  errors=%9  reconnects=%10  RTT=%11ms")
+            .arg(metrics.connectionGeneration)
+            .arg(metrics.receivedBytes)
+            .arg(metrics.receivedFrames)
+            .arg(metrics.sentBytes)
+            .arg(metrics.sentFrames)
+            .arg(metrics.queuedMessages)
+            .arg(metrics.queuedBytes)
+            .arg(metrics.queueHighWaterBytes)
+            .arg(metrics.protocolErrors)
+            .arg(metrics.reconnectAttempts)
+            .arg(metrics.lastRoundTripMs));
+}
+
+void TcpWorkbenchWindow::appendDiagnostic(const QString& category,
+                                          const QString& message) {
+    protocolLog_->appendPlainText(
+        QStringLiteral("[%1] %2")
+            .arg(category, message));
+}
+
+void TcpWorkbenchWindow::buildUi() {
+    setWindowTitle(tr("DeviceStudio TCP Workstation Lab"));
+    resize(1180, 720);
+
+    telemetryModel_ = new QStandardItemModel(this);
+    telemetryModel_->setHorizontalHeaderLabels(
+        {tr("Time"), tr("Device"), tr("Temperature °C"), tr("RPM"),
+         tr("Vibration mm/s"), tr("Load %")});
+    telemetryView_ = new QTableView(this);
+    telemetryView_->setModel(telemetryModel_);
+    telemetryView_->setAlternatingRowColors(true);
+    telemetryView_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    telemetryView_->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+    setCentralWidget(telemetryView_);
+
+    auto* controlDock = new QDockWidget(tr("Connection and command"), this);
+    controlDock->setObjectName(QStringLiteral("TcpLabControlDock"));
+    auto* controlPage = new QWidget(controlDock);
+    auto* controlLayout = new QVBoxLayout(controlPage);
+    auto* stateForm = new QFormLayout;
+    endpointValue_ = new QLabel(QStringLiteral("%1:%2")
+                                    .arg(config_.endpoint.host)
+                                    .arg(config_.endpoint.port),
+                                controlPage);
+    stateValue_ = new QLabel(QStringLiteral("Stopped"), controlPage);
+    stateForm->addRow(tr("Endpoint"), endpointValue_);
+    stateForm->addRow(tr("State"), stateValue_);
+    controlLayout->addLayout(stateForm);
+
+    connectButton_ = new QPushButton(tr("Connect"), controlPage);
+    disconnectButton_ = new QPushButton(tr("Disconnect"), controlPage);
+    auto* connectionRow = new QHBoxLayout;
+    connectionRow->addWidget(connectButton_);
+    connectionRow->addWidget(disconnectButton_);
+    controlLayout->addLayout(connectionRow);
+
+    auto* commandGroup = new QGroupBox(tr("Command request"), controlPage);
+    auto* commandLayout = new QFormLayout(commandGroup);
+    commandBox_ = new QComboBox(commandGroup);
+    commandBox_->addItems({QStringLiteral("set-speed"),
+                           QStringLiteral("start-spindle"),
+                           QStringLiteral("stop-spindle")});
+    argumentsEdit_ = new QLineEdit(QStringLiteral("2400"), commandGroup);
+    idempotentCheck_ = new QCheckBox(tr("Safe to retry"), commandGroup);
+    idempotentCheck_->setChecked(true);
+    sendButton_ = new QPushButton(tr("Send"), commandGroup);
+    commandLayout->addRow(tr("Command"), commandBox_);
+    commandLayout->addRow(tr("Arguments"), argumentsEdit_);
+    commandLayout->addRow(QString(), idempotentCheck_);
+    commandLayout->addRow(QString(), sendButton_);
+    controlLayout->addWidget(commandGroup);
+    controlLayout->addStretch(1);
+    controlDock->setWidget(controlPage);
+    addDockWidget(Qt::LeftDockWidgetArea, controlDock);
+
+    auto* protocolDock = new QDockWidget(tr("Protocol inspector and diagnostics"), this);
+    protocolDock->setObjectName(QStringLiteral("TcpLabProtocolDock"));
+    protocolLog_ = new QPlainTextEdit(protocolDock);
+    protocolLog_->setReadOnly(true);
+    protocolDock->setWidget(protocolLog_);
+    addDockWidget(Qt::BottomDockWidgetArea, protocolDock);
+
+    auto* metricsDock = new QDockWidget(tr("Network metrics"), this);
+    metricsDock->setObjectName(QStringLiteral("TcpLabMetricsDock"));
+    metricsValue_ = new QLabel(tr("No metrics yet"), metricsDock);
+    metricsValue_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    metricsDock->setWidget(metricsValue_);
+    addDockWidget(Qt::BottomDockWidgetArea, metricsDock);
+    tabifyDockWidget(protocolDock, metricsDock);
+    protocolDock->raise();
+
+    connect(connectButton_, &QPushButton::clicked,
+            this, &TcpWorkbenchWindow::connectRequested);
+    connect(disconnectButton_, &QPushButton::clicked,
+            this, &TcpWorkbenchWindow::disconnectRequested);
+    connect(sendButton_, &QPushButton::clicked,
+            this, &TcpWorkbenchWindow::submitCommand);
+    disconnectButton_->setEnabled(false);
+    sendButton_->setEnabled(false);
+}
+
+void TcpWorkbenchWindow::startNetworkWorker() {
+    session_ = new DeviceSession(config_);
+    session_->moveToThread(&networkThread_);
+    networkThread_.setObjectName(QStringLiteral("TcpLabNetworkThread"));
+
+    connect(&networkThread_, &QThread::started,
+            session_, &DeviceSession::initialize);
+    connect(this, &TcpWorkbenchWindow::connectRequested,
+            session_, &DeviceSession::connectDevice, Qt::QueuedConnection);
+    connect(this, &TcpWorkbenchWindow::disconnectRequested,
+            session_, &DeviceSession::disconnectDevice, Qt::QueuedConnection);
+    connect(this, &TcpWorkbenchWindow::commandRequested,
+            session_, &DeviceSession::sendCommand, Qt::QueuedConnection);
+    connect(this, &TcpWorkbenchWindow::shutdownRequested,
+            session_, &DeviceSession::shutdown, Qt::QueuedConnection);
+    connect(session_, &DeviceSession::finished,
+            session_, &QObject::deleteLater);
+    connect(session_, &DeviceSession::finished,
+            &networkThread_, &QThread::quit);
+
+    connect(session_, &DeviceSession::stateChanged,
+            this, &TcpWorkbenchWindow::onStateChanged);
+    connect(session_, &DeviceSession::telemetryReceived,
+            this, &TcpWorkbenchWindow::onTelemetry);
+    connect(session_, &DeviceSession::commandCompleted,
+            this, &TcpWorkbenchWindow::onCommandResult);
+    connect(session_, &DeviceSession::frameObserved,
+            this, &TcpWorkbenchWindow::onFrame);
+    connect(session_, &DeviceSession::metricsChanged,
+            this, &TcpWorkbenchWindow::onMetrics);
+    connect(session_, &DeviceSession::logMessage,
+            this, &TcpWorkbenchWindow::appendDiagnostic);
+    networkThread_.start();
+}
+
+}  // namespace ds::tcp

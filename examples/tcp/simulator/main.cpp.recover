@@ -1,0 +1,71 @@
+#include "simulator/IndustrialDeviceSimulator.h"
+
+#include <QCommandLineParser>
+#include <QCoreApplication>
+#include <QDebug>
+
+using ds::tcp::FaultProfile;
+using ds::tcp::IndustrialDeviceSimulator;
+
+int main(int argc, char* argv[]) {
+    QCoreApplication application(argc, argv);
+    QCoreApplication::setApplicationName(QStringLiteral("TcpDeviceSimulator"));
+
+    QCommandLineParser parser;
+    parser.setApplicationDescription(
+        QStringLiteral("Fault-injectable DeviceStudio TCP simulator"));
+    parser.addHelpOption();
+    parser.addOption({QStringLiteral("port"), QStringLiteral("listen port"),
+                      QStringLiteral("port"), QStringLiteral("45455")});
+    parser.addOption({QStringLiteral("chunk-bytes"),
+                      QStringLiteral("maximum bytes per socket write; 0 disables"),
+                      QStringLiteral("bytes"), QStringLiteral("0")});
+    parser.addOption({QStringLiteral("chunk-delay"),
+                      QStringLiteral("delay between chunks in milliseconds"),
+                      QStringLiteral("ms"), QStringLiteral("0")});
+    parser.addOption({QStringLiteral("corrupt-every"),
+                      QStringLiteral("corrupt every Nth outbound frame"),
+                      QStringLiteral("n"), QStringLiteral("0")});
+    parser.addOption({QStringLiteral("drop-every"),
+                      QStringLiteral("drop every Nth outbound application frame"),
+                      QStringLiteral("n"), QStringLiteral("0")});
+    parser.addOption({QStringLiteral("disconnect-after"),
+                      QStringLiteral("disconnect after N inbound frames"),
+                      QStringLiteral("n"), QStringLiteral("0")});
+    parser.addOption({QStringLiteral("reply-delay"),
+                      QStringLiteral("command reply delay in milliseconds"),
+                      QStringLiteral("ms"), QStringLiteral("0")});
+    parser.addOption({QStringLiteral("telemetry-ms"),
+                      QStringLiteral("telemetry interval in milliseconds"),
+                      QStringLiteral("ms"), QStringLiteral("250")});
+    parser.process(application);
+
+    const auto integer = [&parser](const QString& name) {
+        bool ok = false;
+        const int value = parser.value(name).toInt(&ok);
+        if (!ok || value < 0) {
+            parser.showHelp(2);
+        }
+        return value;
+    };
+
+    const int portValue = integer(QStringLiteral("port"));
+    if (portValue < 1 || portValue > 65535) {
+        parser.showHelp(2);
+    }
+
+    IndustrialDeviceSimulator simulator;
+    simulator.setFaultProfile({integer(QStringLiteral("chunk-bytes")),
+                               integer(QStringLiteral("chunk-delay")),
+                               integer(QStringLiteral("corrupt-every")),
+                               integer(QStringLiteral("drop-every")),
+                               integer(QStringLiteral("disconnect-after")),
+                               integer(QStringLiteral("reply-delay"))});
+    simulator.setTelemetryIntervalMs(integer(QStringLiteral("telemetry-ms")));
+    QObject::connect(&simulator, &IndustrialDeviceSimulator::logMessage,
+                     [](const QString& message) { qInfo().noquote() << message; });
+    if (!simulator.listen(static_cast<quint16>(portValue))) {
+        return 1;
+    }
+    return application.exec();
+}

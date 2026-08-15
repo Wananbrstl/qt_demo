@@ -1,0 +1,118 @@
+#pragma once
+
+#include <QByteArray>
+#include <QMetaType>
+#include <QString>
+#include <QUuid>
+
+namespace ds::tcp {
+
+// Transport state is intentionally separate from QAbstractSocket::SocketState.
+// The TCP connection may be established while the application handshake is not.
+enum class SessionState : quint8 {
+    Stopped,
+    Disconnected,
+    Connecting,
+    Handshaking,
+    Online,
+    Degraded,
+    Reconnecting,
+    Stopping
+};
+
+[[nodiscard]] QString toString(SessionState state);
+
+enum class MessageType : quint16 {
+    Hello = 1,
+    HelloAck = 2,
+    Heartbeat = 3,
+    HeartbeatAck = 4,
+    Telemetry = 10,
+    CommandRequest = 20,
+    CommandReply = 21,
+    ProtocolError = 255
+};
+
+[[nodiscard]] QString toString(MessageType type);
+
+struct NetworkEndpoint final {
+    QString host{QStringLiteral("127.0.0.1")};
+    quint16 port{45454};
+
+    [[nodiscard]] bool isValid() const noexcept {
+        return !host.trimmed().isEmpty() && port != 0;
+    }
+};
+
+struct ProtocolLimits final {
+    int maximumFrameBytes{1024 * 1024};
+    int maximumBufferedBytes{2 * 1024 * 1024};
+};
+
+struct SessionConfig final {
+    NetworkEndpoint endpoint;
+    ProtocolLimits protocol;
+    int connectTimeoutMs{5000};
+    int handshakeTimeoutMs{3000};
+    int heartbeatIntervalMs{2000};
+    int silenceTimeoutMs{6000};
+    int requestTimeoutMs{3000};
+    int reconnectBaseMs{250};
+    int reconnectMaximumMs{15000};
+    int maximumQueuedMessages{256};
+    int maximumQueuedBytes{2 * 1024 * 1024};
+    int socketWriteHighWaterBytes{256 * 1024};
+    bool automaticReconnect{true};
+
+    [[nodiscard]] QString validate() const;
+};
+
+struct TelemetrySample final {
+    QString deviceId;
+    qint64 capturedAtMs{};
+    double temperatureC{};
+    double spindleRpm{};
+    double vibrationMmPerSecond{};
+    double loadPercent{};
+};
+
+enum class CommandCompletion : quint8 {
+    Accepted,
+    Rejected,
+    TimedOutUnknown,
+    DisconnectedUnknown,
+    QueueRejected,
+    ProtocolFailure
+};
+
+struct CommandResult final {
+    QUuid requestId;
+    CommandCompletion completion{CommandCompletion::ProtocolFailure};
+    QString detail;
+    quint64 connectionGeneration{};
+};
+
+struct SessionMetrics final {
+    quint64 connectionGeneration{};
+    quint64 receivedBytes{};
+    quint64 sentBytes{};
+    quint64 receivedFrames{};
+    quint64 sentFrames{};
+    quint64 protocolErrors{};
+    quint64 reconnectAttempts{};
+    quint64 rejectedMessages{};
+    int decoderBufferedBytes{};
+    int queuedMessages{};
+    int queuedBytes{};
+    int queueHighWaterBytes{};
+    qint64 lastRoundTripMs{-1};
+};
+
+void registerTcpMetaTypes();
+
+}  // namespace ds::tcp
+
+Q_DECLARE_METATYPE(ds::tcp::SessionState)
+Q_DECLARE_METATYPE(ds::tcp::TelemetrySample)
+Q_DECLARE_METATYPE(ds::tcp::CommandResult)
+Q_DECLARE_METATYPE(ds::tcp::SessionMetrics)

@@ -1,0 +1,26 @@
+#pragma once
+
+#include <QtGlobal>
+
+#include <random>
+
+namespace ds::tcp {
+
+// Full-jitter exponential backoff. A deterministic seed makes reconnect tests
+// reproducible; production code supplies QRandomGenerator-derived entropy.
+class BackoffPolicy final {
+public:
+    BackoffPolicy(int baseDelayMs, int maximumDelayMs, quint32 seed);
+
+    [[nodiscard]] int nextDelayMs();
+    void reset() noexcept { attempt_ = 0; }
+    [[nodiscard]] quint32 attempt() const noexcept { return attempt_; }
+
+private:
+    int baseDelayMs_{};
+    int maximumDelayMs_{};
+    quint32 attempt_{};
+    std::mt19937 random_;
+};
+
+}  // namespace ds::tcp

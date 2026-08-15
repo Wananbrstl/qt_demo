@@ -1,0 +1,325 @@
+#include "simulator/IndustrialDeviceSimulator.h"
+
+#include <QCborMap>
+#include <QCborValue>
+#include <QDateTime>
+#include <QHash>
+#include <QPointer>
+#include <QQueue>
+#include <QTcpServer>
+#include <QTcpSocket>
+#include <QTimer>
+#include <QUuid>
+
+#include <cmath>
+#include <utility>
+
+namespace ds::tcp {
+
+struct IndustrialDeviceSimulator::Peer final {
+    explicit Peer(QTcpSocket* peerSocket)
+        : socket(peerSocket) {}
+
+    QTcpSocket* socket{};
+    StreamFrameDecoder decoder;
+    quint32 nextSequence{1};
+    quint64 receivedFrames{};
+    quint64 sentFrames{};
+    bool handshaken{};
+    bool drainingChunks{};
+    // Keep complete frames and advance an offset instead of pre-splitting a
+    // frame into millions of tiny QByteArrays when --chunk-bytes=1.
+    QQueue<QByteArray> outboundFrames;
+    int outboundBytes{};
+    int frontOffset{};
+    QHash<QString, QByteArray> cachedCommandReplies;
+    int cachedCommandReplyBytes{};
+};
+
+IndustrialDeviceSimulator::IndustrialDeviceSimulator(QObject* parent)
+    : QObject(parent),
+      server_(new QTcpServer(this)),
+      telemetryTimer_(new QTimer(this)) {
+    telemetryTimer_->setInterval(250);
+    connect(server_, &QTcpServer::newConnection,
+            this, &IndustrialDeviceSimulator::acceptConnections);
+    connect(telemetryTimer_, &QTimer::timeout,
+            this, &IndustrialDeviceSimulator::broadcastTelemetry);
+}
+
+IndustrialDeviceSimulator::~IndustrialDeviceSimulator() {
+    close();
+}
+
+void IndustrialDeviceSimulator::setTelemetryIntervalMs(const int intervalMs) {
+    telemetryTimer_->setInterval(qMax(20, intervalMs));
+}
+
+bool IndustrialDeviceSimulator::listen(const quint16 port) {
+    if (server_->isListening()) {
+        return true;
+    }
+    if (!server_->listen(QHostAddress::LocalHost, port)) {
+        emit logMessage(QStringLiteral("listen failed: %1").arg(server_->errorString()));
+        return false;
+    }
+    telemetryTimer_->start();
+    emit logMessage(QStringLiteral("simulator listening on 127.0.0.1:%1")
+                        .arg(server_->serverPort()));
+    return true;
+}
+
+quint16 IndustrialDeviceSimulator::serverPort() const {
+    return server_->serverPort();
+}
+
+void IndustrialDeviceSimulator::close() {
+    telemetryTimer_->stop();
+    server_->close();
+    const auto sockets = peers_.keys();
+    for (QTcpSocket* socket : sockets) {
+        socket->abort();
+        removePeer(socket);
+    }
+}
+
+void IndustrialDeviceSimulator::acceptConnections() {
+    while (server_->hasPendingConnections()) {
+        QTcpSocket* socket = server_->nextPendingConnection();
+        auto* peer = new Peer(socket);
+        peers_.insert(socket, peer);
+        connect(socket, &QTcpSocket::readyRead, this, [this, peer] {
+            readPeer(peer);
+        });
+        connect(socket, &QTcpSocket::disconnected, this, [this, socket] {
+            removePeer(socket);
+        });
+        emit logMessage(QStringLiteral("client connected from %1:%2")
+                            .arg(socket->peerAddress().toString())
+                            .arg(socket->peerPort()));
+        emit clientCountChanged(peers_.size());
+    }
+}
+
+void IndustrialDeviceSimulator::removePeer(QTcpSocket* socket) {
+    Peer* peer = peers_.take(socket);
+    if (!peer) {
+        return;
+    }
+    delete peer;
+    socket->deleteLater();
+    emit clientCountChanged(peers_.size());
+}
+
+void IndustrialDeviceSimulator::readPeer(Peer* peer) {
+    if (!peer || !peer->socket) {
+        return;
+    }
+    DecodeBatch batch = peer->decoder.append(peer->socket->readAll());
+    for (const DecodeError& error : batch.errors) {
+        emit logMessage(QStringLiteral("decoder: %1").arg(error.detail));
+    }
+    for (const Frame& frame : batch.frames) {
+        ++peer->receivedFrames;
+        if (faults_.disconnectAfterNFrames > 0
+            && peer->receivedFrames
+                >= static_cast<quint64>(faults_.disconnectAfterNFrames)) {
+            emit logMessage(QStringLiteral("fault: disconnect after frame %1")
+                                .arg(peer->receivedFrames));
+            peer->socket->abort();
+            return;
+        }
+        handleFrame(peer, frame);
+    }
+}
+
+void IndustrialDeviceSimulator::handleFrame(Peer* peer, const Frame& frame) {
+    switch (frame.type) {
+    case MessageType::Hello: {
+        peer->handshaken = true;
+        QCborMap reply;
+        reply.insert(QStringLiteral("deviceId"), QStringLiteral("simulator-01"));
+        reply.insert(QStringLiteral("protocolVersion"), FrameCodec::version);
+        reply.insert(QStringLiteral("capabilities"),
+                     QStringLiteral("telemetry,commands,idempotency"));
+        sendFrame(peer, MessageType::HelloAck, QCborValue(reply).toCbor());
+        break;
+    }
+    case MessageType::Heartbeat:
+        sendFrame(peer, MessageType::HeartbeatAck, frame.payload);
+        break;
+    case MessageType::CommandRequest: {
+        QCborParserError error;
+        const QCborValue value = QCborValue::fromCbor(frame.payload, &error);
+        if (error.error != QCborError::NoError || !value.isMap()) {
+            sendFrame(peer, MessageType::ProtocolError,
+                      QByteArrayLiteral("invalid command CBOR"));
+            return;
+        }
+        const QCborMap request = value.toMap();
+        const QString requestId = request.value(QStringLiteral("requestId")).toString();
+        const QString command = request.value(QStringLiteral("command")).toString();
+        if (QUuid(requestId).isNull() || command.isEmpty()
+            || command.size() > 256) {
+            sendFrame(peer, MessageType::ProtocolError,
+                      QByteArrayLiteral("invalid requestId or command"));
+            return;
+        }
+        QByteArray encodedReply = peer->cachedCommandReplies.value(requestId);
+        if (encodedReply.isEmpty()) {
+            QCborMap reply;
+            reply.insert(QStringLiteral("requestId"), requestId);
+            reply.insert(QStringLiteral("accepted"), true);
+            reply.insert(QStringLiteral("detail"),
+                         QStringLiteral("command '%1' executed once")
+                             .arg(command));
+            encodedReply = QCborValue(reply).toCbor();
+            // Bound both entry count and payload bytes. A count-only limit is
+            // insufficient when commands can carry attacker-controlled text.
+            constexpr int maximumCachedReplies = 1024;
+            constexpr int maximumCachedReplyBytes = 2 * 1024 * 1024;
+            while (!peer->cachedCommandReplies.isEmpty()
+                   && (peer->cachedCommandReplies.size() >= maximumCachedReplies
+                       || peer->cachedCommandReplyBytes + encodedReply.size()
+                           > maximumCachedReplyBytes)) {
+                auto oldestAvailable = peer->cachedCommandReplies.begin();
+                peer->cachedCommandReplyBytes -= oldestAvailable.value().size();
+                peer->cachedCommandReplies.erase(oldestAvailable);
+            }
+            if (encodedReply.size() <= maximumCachedReplyBytes) {
+                peer->cachedCommandReplyBytes += encodedReply.size();
+                peer->cachedCommandReplies.insert(requestId, encodedReply);
+            }
+        }
+        QPointer<QTcpSocket> guardedSocket(peer->socket);
+        const int delay = qMax(0, faults_.commandReplyDelayMs);
+        QTimer::singleShot(delay, this, [this, peer, guardedSocket, encodedReply] {
+            if (guardedSocket && peers_.value(guardedSocket.data()) == peer) {
+                sendFrame(peer, MessageType::CommandReply, encodedReply);
+            }
+        });
+        break;
+    }
+    default:
+        sendFrame(peer, MessageType::ProtocolError,
+                  QByteArrayLiteral("unexpected message type"));
+        break;
+    }
+}
+
+void IndustrialDeviceSimulator::sendFrame(Peer* peer,
+                                          const MessageType type,
+                                          QByteArray payload) {
+    if (!peer || !peer->socket
+        || peer->socket->state() != QAbstractSocket::ConnectedState) {
+        return;
+    }
+    ++peer->sentFrames;
+    if (faults_.dropEveryNFrames > 0
+        && peer->sentFrames % static_cast<quint64>(faults_.dropEveryNFrames) == 0) {
+        emit logMessage(QStringLiteral("fault: dropped application frame %1")
+                            .arg(peer->sentFrames));
+        return;
+    }
+    QByteArray encoded = FrameCodec::encode(
+        {type, 0, peer->nextSequence++, std::move(payload)});
+    if (faults_.corruptEveryNFrames > 0
+        && peer->sentFrames % static_cast<quint64>(faults_.corruptEveryNFrames) == 0
+        && encoded.size() > FrameCodec::headerBytes) {
+        encoded[FrameCodec::headerBytes] =
+            static_cast<char>(encoded.at(FrameCodec::headerBytes) ^ 0x01);
+        emit logMessage(QStringLiteral("fault: corrupted application frame %1")
+                            .arg(peer->sentFrames));
+    }
+    queueEncodedFrame(peer, std::move(encoded));
+}
+
+void IndustrialDeviceSimulator::queueEncodedFrame(Peer* peer,
+                                                   QByteArray bytes) {
+    if (!peer || !peer->socket || bytes.isEmpty()) {
+        return;
+    }
+    constexpr int maximumOutboundBytes = 4 * 1024 * 1024;
+    if (bytes.size() > maximumOutboundBytes - peer->outboundBytes) {
+        emit logMessage(QStringLiteral(
+            "simulator outbound backlog limit reached; dropped one frame"));
+        return;
+    }
+    peer->outboundBytes += bytes.size();
+    peer->outboundFrames.enqueue(std::move(bytes));
+    if (!peer->drainingChunks) {
+        peer->drainingChunks = true;
+        drainNextChunk(peer);
+    }
+}
+
+void IndustrialDeviceSimulator::drainNextChunk(Peer* peer) {
+    if (!peer || !peer->socket
+        || peer->socket->state() != QAbstractSocket::ConnectedState) {
+        return;
+    }
+    if (peer->outboundFrames.isEmpty()) {
+        peer->drainingChunks = false;
+        peer->frontOffset = 0;
+        return;
+    }
+
+    // Bound the second buffering layer as well: dequeuing application data
+    // must not simply move an unlimited backlog into QTcpSocket.
+    constexpr qint64 socketWriteHighWaterBytes = 256 * 1024;
+    if (peer->socket->bytesToWrite() < socketWriteHighWaterBytes) {
+        const QByteArray& frame = peer->outboundFrames.head();
+        const int remaining = frame.size() - peer->frontOffset;
+        const int configuredChunk = faults_.maximumChunkBytes > 0
+            ? faults_.maximumChunkBytes : remaining;
+        const int chunkBytes = qMin(remaining, configuredChunk);
+        const qint64 accepted = peer->socket->write(
+            frame.constData() + peer->frontOffset, chunkBytes);
+        if (accepted < 0) {
+            emit logMessage(QStringLiteral("simulator socket write failed: %1")
+                                .arg(peer->socket->errorString()));
+            peer->socket->abort();
+            return;
+        }
+        peer->frontOffset += static_cast<int>(accepted);
+        peer->outboundBytes -= static_cast<int>(accepted);
+        if (peer->frontOffset == frame.size()) {
+            peer->outboundFrames.dequeue();
+            peer->frontOffset = 0;
+        }
+    }
+    QPointer<QTcpSocket> guarded(peer->socket);
+    // A configured zero delay still yields through the event queue. When the
+    // socket is above its high-water mark, poll no faster than once per ms.
+    const int nextDelayMs = peer->socket->bytesToWrite()
+            >= socketWriteHighWaterBytes
+        ? qMax(1, faults_.chunkDelayMs)
+        : qMax(0, faults_.chunkDelayMs);
+    QTimer::singleShot(nextDelayMs, this,
+                       [this, peer, guarded] {
+        if (guarded && peers_.value(guarded.data()) == peer) {
+            drainNextChunk(peer);
+        }
+    });
+}
+
+void IndustrialDeviceSimulator::broadcastTelemetry() {
+    ++telemetryCounter_;
+    const double phase = static_cast<double>(telemetryCounter_) / 20.0;
+    QCborMap map;
+    map.insert(QStringLiteral("deviceId"), QStringLiteral("simulator-01"));
+    map.insert(QStringLiteral("capturedAtMs"), QDateTime::currentMSecsSinceEpoch());
+    map.insert(QStringLiteral("temperatureC"), 42.0 + std::sin(phase) * 4.0);
+    map.insert(QStringLiteral("spindleRpm"), 2400.0 + std::sin(phase * 0.5) * 100.0);
+    map.insert(QStringLiteral("vibration"), 1.2 + std::abs(std::sin(phase * 1.7)));
+    map.insert(QStringLiteral("loadPercent"), 60.0 + std::sin(phase * 0.7) * 20.0);
+    const QByteArray payload = QCborValue(map).toCbor();
+    const auto peers = peers_.values();
+    for (Peer* peer : peers) {
+        if (peer->handshaken) {
+            sendFrame(peer, MessageType::Telemetry, payload);
+        }
+    }
+}
+
+}  // namespace ds::tcp

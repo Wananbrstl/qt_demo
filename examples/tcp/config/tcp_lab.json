@@ -1,0 +1,27 @@
+{
+  "endpoint": {
+    "host": "127.0.0.1",
+    "port": 45455
+  },
+  "protocol": {
+    "maximumFrameBytes": 1048576,
+    "maximumBufferedBytes": 2097152
+  },
+  "timing": {
+    "connectTimeoutMs": 5000,
+    "handshakeTimeoutMs": 3000,
+    "heartbeatIntervalMs": 2000,
+    "silenceTimeoutMs": 6000,
+    "requestTimeoutMs": 3000
+  },
+  "reconnect": {
+    "automatic": true,
+    "baseDelayMs": 250,
+    "maximumDelayMs": 15000
+  },
+  "queue": {
+    "maximumMessages": 256,
+    "maximumBytes": 2097152,
+    "socketWriteHighWaterBytes": 262144
+  }
+}

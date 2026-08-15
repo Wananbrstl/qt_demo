@@ -1,0 +1,122 @@
+#include "protocol/FrameCodec.h"
+
+#include <QTest>
+
+using namespace ds::tcp;
+
+class TcpFrameCodecTest final : public QObject {
+    Q_OBJECT
+
+private slots:
+    void crcKnownVector();
+    void roundTrip();
+    void everyFragmentBoundary();
+    void coalescedFrames();
+    void recoversAfterGarbage();
+    void rejectsCorruption();
+    void rejectsOversizedFrame();
+    void enforcesBufferLimitBeforeAppend();
+};
+
+void TcpFrameCodecTest::crcKnownVector() {
+    QCOMPARE(FrameCodec::crc32(QByteArrayLiteral("123456789")), 0xCBF43926U);
+}
+
+void TcpFrameCodecTest::roundTrip() {
+    const Frame source{MessageType::CommandRequest, 3, 42,
+                       QByteArrayLiteral("binary\0payload")};
+    StreamFrameDecoder decoder;
+    const DecodeBatch batch = decoder.append(FrameCodec::encode(source));
+    QCOMPARE(batch.errors.size(), 0);
+    QCOMPARE(batch.frames.size(), 1);
+    QCOMPARE(static_cast<int>(batch.frames.front().type),
+             static_cast<int>(source.type));
+    QCOMPARE(batch.frames.front().flags, source.flags);
+    QCOMPARE(batch.frames.front().sequence, source.sequence);
+    QCOMPARE(batch.frames.front().payload, source.payload);
+}
+
+void TcpFrameCodecTest::everyFragmentBoundary() {
+    const QByteArray encoded = FrameCodec::encode(
+        {MessageType::Telemetry, 0, 7, QByteArrayLiteral("abcdef0123456789")});
+    for (int split = 1; split < encoded.size(); ++split) {
+        StreamFrameDecoder decoder;
+        const DecodeBatch first = decoder.append(encoded.left(split));
+        QVERIFY2(first.frames.isEmpty(), qPrintable(QStringLiteral("split=%1").arg(split)));
+        const DecodeBatch second = decoder.append(encoded.mid(split));
+        QCOMPARE(second.frames.size(), 1);
+        QCOMPARE(second.frames.front().sequence, quint32{7});
+        QCOMPARE(decoder.bufferedBytes(), 0);
+    }
+}
+
+void TcpFrameCodecTest::coalescedFrames() {
+    QByteArray stream;
+    constexpr int frameCount = 100;
+    for (int index = 0; index < frameCount; ++index) {
+        stream += FrameCodec::encode(
+            {MessageType::Heartbeat, 0, static_cast<quint32>(index), {}});
+    }
+    StreamFrameDecoder decoder;
+    const DecodeBatch batch = decoder.append(stream);
+    QCOMPARE(batch.errors.size(), 0);
+    QCOMPARE(batch.frames.size(), frameCount);
+    for (int index = 0; index < frameCount; ++index) {
+        QCOMPARE(batch.frames.at(index).sequence, static_cast<quint32>(index));
+    }
+}
+
+void TcpFrameCodecTest::recoversAfterGarbage() {
+    const QByteArray valid = FrameCodec::encode(
+        {MessageType::HelloAck, 0, 11, QByteArrayLiteral("ok")});
+    StreamFrameDecoder decoder;
+    const DecodeBatch batch = decoder.append(QByteArrayLiteral("garbage-prefix") + valid);
+    QCOMPARE(batch.errors.size(), 1);
+    QCOMPARE(static_cast<int>(batch.errors.front().code),
+             static_cast<int>(DecodeErrorCode::GarbageDiscarded));
+    QCOMPARE(batch.frames.size(), 1);
+    QCOMPARE(batch.frames.front().sequence, quint32{11});
+}
+
+void TcpFrameCodecTest::rejectsCorruption() {
+    QByteArray encoded = FrameCodec::encode(
+        {MessageType::Telemetry, 0, 21, QByteArrayLiteral("payload")});
+    encoded[FrameCodec::headerBytes] =
+        static_cast<char>(encoded.at(FrameCodec::headerBytes) ^ 0x40);
+    StreamFrameDecoder decoder;
+    const DecodeBatch batch = decoder.append(encoded);
+    QCOMPARE(batch.frames.size(), 0);
+    QCOMPARE(batch.errors.size(), 1);
+    QCOMPARE(static_cast<int>(batch.errors.front().code),
+             static_cast<int>(DecodeErrorCode::ChecksumMismatch));
+}
+
+void TcpFrameCodecTest::rejectsOversizedFrame() {
+    ProtocolLimits limits;
+    limits.maximumFrameBytes = 64;
+    limits.maximumBufferedBytes = 512;
+    StreamFrameDecoder decoder(limits);
+    const QByteArray encoded = FrameCodec::encode(
+        {MessageType::Telemetry, 0, 31, QByteArray(100, 'x')});
+    const DecodeBatch batch = decoder.append(encoded);
+    QVERIFY(batch.frames.isEmpty());
+    QVERIFY(!batch.errors.isEmpty());
+    QCOMPARE(static_cast<int>(batch.errors.front().code),
+             static_cast<int>(DecodeErrorCode::FrameTooLarge));
+}
+
+void TcpFrameCodecTest::enforcesBufferLimitBeforeAppend() {
+    ProtocolLimits limits;
+    limits.maximumFrameBytes = 64;
+    limits.maximumBufferedBytes = 80;
+    StreamFrameDecoder decoder(limits);
+    const DecodeBatch batch = decoder.append(QByteArray(81, 'x'));
+    QCOMPARE(batch.frames.size(), 0);
+    QCOMPARE(batch.errors.size(), 1);
+    QCOMPARE(static_cast<int>(batch.errors.front().code),
+             static_cast<int>(DecodeErrorCode::BufferLimitExceeded));
+    QCOMPARE(decoder.bufferedBytes(), 0);
+}
+
+QTEST_APPLESS_MAIN(TcpFrameCodecTest)
+#include "test_frame_codec.moc"

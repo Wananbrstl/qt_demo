@@ -1,0 +1,99 @@
+#include "common/TcpTypes.h"
+#include "session/DeviceSession.h"
+#include "simulator/IndustrialDeviceSimulator.h"
+
+#include <QSignalSpy>
+#include <QTest>
+
+using namespace ds::tcp;
+
+class TcpIntegrationTest final : public QObject {
+    Q_OBJECT
+
+private slots:
+    void initTestCase();
+    void connectsThroughOneByteFragmentsAndRunsCommand();
+    void reportsUnknownWhenReplyMissesDeadline();
+
+private:
+    static bool observedState(const QSignalSpy& spy, SessionState state);
+};
+
+void TcpIntegrationTest::initTestCase() {
+    registerTcpMetaTypes();
+}
+
+bool TcpIntegrationTest::observedState(const QSignalSpy& spy,
+                                       const SessionState state) {
+    for (const QList<QVariant>& arguments : spy) {
+        if (qvariant_cast<SessionState>(arguments.at(0)) == state) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void TcpIntegrationTest::connectsThroughOneByteFragmentsAndRunsCommand() {
+    IndustrialDeviceSimulator simulator;
+    simulator.setFaultProfile({1, 0, 0, 0, 0, 0});
+    simulator.setTelemetryIntervalMs(25);
+    QVERIFY(simulator.listen(0));
+
+    SessionConfig config;
+    config.endpoint.port = simulator.serverPort();
+    config.automaticReconnect = false;
+    config.heartbeatIntervalMs = 100;
+    config.silenceTimeoutMs = 1000;
+    config.requestTimeoutMs = 1000;
+    DeviceSession session(config, 7);
+    QSignalSpy stateSpy(&session, &DeviceSession::stateChanged);
+    QSignalSpy telemetrySpy(&session, &DeviceSession::telemetryReceived);
+    QSignalSpy commandSpy(&session, &DeviceSession::commandCompleted);
+
+    session.initialize();
+    session.connectDevice();
+    QTRY_VERIFY_WITH_TIMEOUT(observedState(stateSpy, SessionState::Online), 3000);
+    QTRY_VERIFY_WITH_TIMEOUT(!telemetrySpy.isEmpty(), 3000);
+
+    const QUuid requestId = QUuid::createUuid();
+    session.sendCommand(requestId, QStringLiteral("set-speed"),
+                        QByteArrayLiteral("2400"), true);
+    QTRY_COMPARE_WITH_TIMEOUT(commandSpy.size(), 1, 3000);
+    const CommandResult result =
+        qvariant_cast<CommandResult>(commandSpy.front().at(0));
+    QCOMPARE(result.requestId, requestId);
+    QCOMPARE(static_cast<int>(result.completion),
+             static_cast<int>(CommandCompletion::Accepted));
+    session.shutdown();
+}
+
+void TcpIntegrationTest::reportsUnknownWhenReplyMissesDeadline() {
+    IndustrialDeviceSimulator simulator;
+    simulator.setFaultProfile({0, 0, 0, 0, 0, 500});
+    QVERIFY(simulator.listen(0));
+
+    SessionConfig config;
+    config.endpoint.port = simulator.serverPort();
+    config.automaticReconnect = false;
+    config.requestTimeoutMs = 100;
+    config.heartbeatIntervalMs = 100;
+    config.silenceTimeoutMs = 1000;
+    DeviceSession session(config, 9);
+    QSignalSpy stateSpy(&session, &DeviceSession::stateChanged);
+    QSignalSpy commandSpy(&session, &DeviceSession::commandCompleted);
+
+    session.initialize();
+    session.connectDevice();
+    QTRY_VERIFY_WITH_TIMEOUT(observedState(stateSpy, SessionState::Online), 3000);
+    session.sendCommand(QUuid::createUuid(), QStringLiteral("start-spindle"), {}, false);
+    QTRY_COMPARE_WITH_TIMEOUT(commandSpy.size(), 1, 2000);
+    const CommandResult result =
+        qvariant_cast<CommandResult>(commandSpy.front().at(0));
+    QCOMPARE(static_cast<int>(result.completion),
+             static_cast<int>(CommandCompletion::TimedOutUnknown));
+    QVERIFY(result.detail.contains(QStringLiteral("unknown"), Qt::CaseInsensitive));
+    session.shutdown();
+}
+
+QTEST_GUILESS_MAIN(TcpIntegrationTest)
+#include "test_integration.moc"

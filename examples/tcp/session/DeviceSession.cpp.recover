@@ -1,0 +1,499 @@
+#include "session/DeviceSession.h"
+
+#include <QCborMap>
+#include <QCborValue>
+#include <QDateTime>
+#include <QLoggingCategory>
+#include <QTcpSocket>
+#include <QThread>
+#include <QTimer>
+
+#include <utility>
+
+Q_LOGGING_CATEGORY(tcpSessionLog, "devicestudio.tcp.session")
+Q_LOGGING_CATEGORY(tcpProtocolLog, "devicestudio.tcp.protocol")
+
+namespace ds::tcp {
+namespace {
+
+QByteArray cbor(const QCborMap& map) {
+    return QCborValue(map).toCbor();
+}
+
+QString parserErrorText(const QCborParserError& error) {
+    return QStringLiteral("CBOR error %1 at offset %2")
+        .arg(static_cast<int>(error.error))
+        .arg(error.offset);
+}
+
+}  // namespace
+
+DeviceSession::DeviceSession(SessionConfig config,
+                             const quint32 randomSeed,
+                             QObject* parent)
+    : QObject(parent),
+      config_(std::move(config)),
+      backoff_(config_.reconnectBaseMs, config_.reconnectMaximumMs, randomSeed),
+      decoder_(config_.protocol),
+      writeQueue_(config_.maximumQueuedMessages, config_.maximumQueuedBytes) {}
+
+DeviceSession::~DeviceSession() = default;
+
+void DeviceSession::initialize() {
+    Q_ASSERT(QThread::currentThread() == thread());
+    if (initialized_) {
+        return;
+    }
+    const QString validationError = config_.validate();
+    if (!validationError.isEmpty()) {
+        emit logMessage(QStringLiteral("configuration"), validationError);
+        transition(SessionState::Stopped, validationError);
+        return;
+    }
+
+    socket_ = new QTcpSocket(this);
+    connectTimeout_ = new QTimer(this);
+    handshakeTimeout_ = new QTimer(this);
+    heartbeatTimer_ = new QTimer(this);
+    reconnectTimer_ = new QTimer(this);
+    pendingTimer_ = new QTimer(this);
+    metricsTimer_ = new QTimer(this);
+
+    connectTimeout_->setSingleShot(true);
+    handshakeTimeout_->setSingleShot(true);
+    reconnectTimer_->setSingleShot(true);
+    heartbeatTimer_->setInterval(config_.heartbeatIntervalMs);
+    pendingTimer_->setInterval(qMax(25, qMin(250, config_.requestTimeoutMs / 4)));
+    metricsTimer_->setInterval(1000);
+
+    connect(socket_, &QTcpSocket::connected, this, &DeviceSession::onConnected);
+    connect(socket_, &QTcpSocket::disconnected, this, &DeviceSession::onDisconnected);
+    connect(socket_, &QTcpSocket::readyRead, this, &DeviceSession::onReadyRead);
+    connect(socket_, &QTcpSocket::bytesWritten, this, &DeviceSession::pumpWriteQueue);
+    connect(socket_, &QTcpSocket::errorOccurred, this, &DeviceSession::onSocketError);
+    connect(connectTimeout_, &QTimer::timeout, this, [this] {
+        emit logMessage(QStringLiteral("transport"),
+                        QStringLiteral("TCP connect timeout"));
+        socket_->abort();
+        scheduleReconnect(QStringLiteral("connect timeout"));
+    });
+    connect(handshakeTimeout_, &QTimer::timeout, this, [this] {
+        emit logMessage(QStringLiteral("protocol"),
+                        QStringLiteral("application handshake timeout"));
+        socket_->abort();
+        scheduleReconnect(QStringLiteral("handshake timeout"));
+    });
+    connect(heartbeatTimer_, &QTimer::timeout,
+            this, &DeviceSession::onHeartbeatTick);
+    connect(reconnectTimer_, &QTimer::timeout,
+            this, &DeviceSession::startConnectionAttempt);
+    connect(pendingTimer_, &QTimer::timeout,
+            this, &DeviceSession::onPendingScan);
+    connect(metricsTimer_, &QTimer::timeout,
+            this, &DeviceSession::publishMetrics);
+
+    monotonicClock_.start();
+    lastInboundMs_ = monotonicClock_.elapsed();
+    pendingTimer_->start();
+    metricsTimer_->start();
+    initialized_ = true;
+    transition(SessionState::Disconnected, QStringLiteral("session initialized"));
+}
+
+void DeviceSession::connectDevice() {
+    Q_ASSERT(QThread::currentThread() == thread());
+    if (!initialized_ || shutdownRequested_) {
+        return;
+    }
+    userDisconnectRequested_ = false;
+    if (state_ == SessionState::Online || state_ == SessionState::Connecting
+        || state_ == SessionState::Handshaking) {
+        return;
+    }
+    reconnectTimer_->stop();
+    startConnectionAttempt();
+}
+
+void DeviceSession::disconnectDevice() {
+    Q_ASSERT(QThread::currentThread() == thread());
+    userDisconnectRequested_ = true;
+    reconnectTimer_->stop();
+    heartbeatTimer_->stop();
+    connectTimeout_->stop();
+    handshakeTimeout_->stop();
+    failPending(CommandCompletion::DisconnectedUnknown,
+                QStringLiteral("user disconnected while command was pending"));
+    if (socket_ && socket_->state() != QAbstractSocket::UnconnectedState) {
+        socket_->disconnectFromHost();
+    } else {
+        transition(SessionState::Disconnected, QStringLiteral("user disconnected"));
+    }
+}
+
+void DeviceSession::sendCommand(QUuid requestId, QString command,
+                                QByteArray arguments, const bool idempotent) {
+    Q_ASSERT(QThread::currentThread() == thread());
+    if (requestId.isNull()) {
+        requestId = QUuid::createUuid();
+    }
+    if (state_ != SessionState::Online) {
+        emit commandCompleted({requestId, CommandCompletion::DisconnectedUnknown,
+                               QStringLiteral("session is not online"),
+                               metrics_.connectionGeneration});
+        return;
+    }
+    if (pending_.contains(requestId)) {
+        emit commandCompleted({requestId, CommandCompletion::ProtocolFailure,
+                               QStringLiteral("duplicate request identifier"),
+                               metrics_.connectionGeneration});
+        return;
+    }
+
+    QCborMap map;
+    map.insert(QStringLiteral("requestId"), requestId.toString(QUuid::WithoutBraces));
+    map.insert(QStringLiteral("command"), std::move(command));
+    map.insert(QStringLiteral("arguments"), std::move(arguments));
+    map.insert(QStringLiteral("idempotent"), idempotent);
+    if (!enqueueFrame(MessageType::CommandRequest, cbor(map), TrafficClass::Control)) {
+        emit commandCompleted({requestId, CommandCompletion::QueueRejected,
+                               QStringLiteral("bounded outbound queue rejected command"),
+                               metrics_.connectionGeneration});
+        return;
+    }
+    pending_.insert(requestId,
+                    {monotonicClock_.elapsed() + config_.requestTimeoutMs,
+                     metrics_.connectionGeneration, idempotent,
+                     map.value(QStringLiteral("command")).toString()});
+}
+
+void DeviceSession::shutdown() {
+    Q_ASSERT(QThread::currentThread() == thread());
+    if (shutdownRequested_) {
+        return;
+    }
+    shutdownRequested_ = true;
+    userDisconnectRequested_ = true;
+    transition(SessionState::Stopping, QStringLiteral("application shutdown"));
+    for (QTimer* timer : {connectTimeout_, handshakeTimeout_, heartbeatTimer_,
+                          reconnectTimer_, pendingTimer_, metricsTimer_}) {
+        if (timer) {
+            timer->stop();
+        }
+    }
+    failPending(CommandCompletion::DisconnectedUnknown,
+                QStringLiteral("application shutdown"));
+    writeQueue_.clear();
+    decoder_.reset();
+    if (socket_) {
+        socket_->abort();
+    }
+    transition(SessionState::Stopped, QStringLiteral("shutdown complete"));
+    emit finished();
+}
+
+void DeviceSession::onConnected() {
+    connectTimeout_->stop();
+    ++metrics_.connectionGeneration;
+    decoder_.reset();
+    writeQueue_.clear();
+    lastInboundMs_ = monotonicClock_.elapsed();
+    transition(SessionState::Handshaking, QStringLiteral("TCP connected"));
+
+    QCborMap hello;
+    hello.insert(QStringLiteral("client"), QStringLiteral("TcpWorkstation"));
+    hello.insert(QStringLiteral("protocolVersion"), FrameCodec::version);
+    hello.insert(QStringLiteral("connectionGeneration"),
+                 static_cast<qint64>(metrics_.connectionGeneration));
+    enqueueFrame(MessageType::Hello, cbor(hello), TrafficClass::Control);
+    handshakeTimeout_->start(config_.handshakeTimeoutMs);
+}
+
+void DeviceSession::onDisconnected() {
+    connectTimeout_->stop();
+    handshakeTimeout_->stop();
+    heartbeatTimer_->stop();
+    decoder_.reset();
+    writeQueue_.clear();
+    failPending(CommandCompletion::DisconnectedUnknown,
+                QStringLiteral("connection lost before acknowledgement"));
+    if (shutdownRequested_) {
+        return;
+    }
+    if (userDisconnectRequested_ || !config_.automaticReconnect) {
+        transition(SessionState::Disconnected, QStringLiteral("TCP disconnected"));
+    } else {
+        scheduleReconnect(QStringLiteral("TCP disconnected"));
+    }
+}
+
+void DeviceSession::onReadyRead() {
+    const QByteArray bytes = socket_->readAll();
+    metrics_.receivedBytes += static_cast<quint64>(bytes.size());
+    lastInboundMs_ = monotonicClock_.elapsed();
+    DecodeBatch batch = decoder_.append(bytes);
+    metrics_.decoderBufferedBytes = decoder_.bufferedBytes();
+    for (const DecodeError& error : batch.errors) {
+        ++metrics_.protocolErrors;
+        emit logMessage(QStringLiteral("protocol"), error.detail);
+        qCWarning(tcpProtocolLog) << error.detail;
+    }
+    for (const Frame& frame : batch.frames) {
+        ++metrics_.receivedFrames;
+        emit frameObserved(QStringLiteral("RX"), frame.type,
+                           frame.sequence, frame.payload.size());
+        handleFrame(frame);
+    }
+}
+
+void DeviceSession::onSocketError() {
+    if (!socket_) {
+        return;
+    }
+    emit logMessage(QStringLiteral("transport"), socket_->errorString());
+    qCWarning(tcpSessionLog) << socket_->error() << socket_->errorString();
+    if (socket_->state() == QAbstractSocket::UnconnectedState
+        && state_ != SessionState::Disconnected
+        && state_ != SessionState::Reconnecting
+        && !userDisconnectRequested_ && !shutdownRequested_) {
+        scheduleReconnect(socket_->errorString());
+    }
+}
+
+void DeviceSession::onHeartbeatTick() {
+    const qint64 now = monotonicClock_.elapsed();
+    if (now - lastInboundMs_ > config_.silenceTimeoutMs) {
+        transition(SessionState::Degraded,
+                   QStringLiteral("inbound silence exceeded %1 ms")
+                       .arg(config_.silenceTimeoutMs));
+        socket_->abort();
+        scheduleReconnect(QStringLiteral("heartbeat silence timeout"));
+        return;
+    }
+    QCborMap heartbeat;
+    heartbeat.insert(QStringLiteral("sentAt"), now);
+    enqueueFrame(MessageType::Heartbeat, cbor(heartbeat), TrafficClass::Heartbeat);
+}
+
+void DeviceSession::onPendingScan() {
+    const qint64 now = monotonicClock_.elapsed();
+    QList<QUuid> expired;
+    for (auto iterator = pending_.cbegin(); iterator != pending_.cend(); ++iterator) {
+        if (iterator->deadlineMs <= now) {
+            expired.push_back(iterator.key());
+        }
+    }
+    for (const QUuid& requestId : expired) {
+        const PendingRequest pending = pending_.take(requestId);
+        emit commandCompleted({requestId, CommandCompletion::TimedOutUnknown,
+                               QStringLiteral("command '%1' timed out; execution state unknown")
+                                   .arg(pending.command),
+                               pending.connectionGeneration});
+    }
+}
+
+void DeviceSession::pumpWriteQueue() {
+    if (!socket_ || socket_->state() != QAbstractSocket::ConnectedState) {
+        return;
+    }
+    while (socket_->bytesToWrite() < config_.socketWriteHighWaterBytes) {
+        auto next = writeQueue_.takeNext();
+        if (!next) {
+            break;
+        }
+        const qint64 accepted = socket_->write(next->bytes);
+        if (accepted < 0) {
+            emit logMessage(QStringLiteral("transport"), socket_->errorString());
+            break;
+        }
+        metrics_.sentBytes += static_cast<quint64>(accepted);
+    }
+}
+
+void DeviceSession::startConnectionAttempt() {
+    if (shutdownRequested_ || userDisconnectRequested_ || !socket_) {
+        return;
+    }
+    if (socket_->state() != QAbstractSocket::UnconnectedState) {
+        socket_->abort();
+    }
+    transition(SessionState::Connecting,
+               QStringLiteral("connecting to %1:%2")
+                   .arg(config_.endpoint.host)
+                   .arg(config_.endpoint.port));
+    socket_->connectToHost(config_.endpoint.host, config_.endpoint.port);
+    connectTimeout_->start(config_.connectTimeoutMs);
+}
+
+void DeviceSession::scheduleReconnect(QString reason) {
+    if (shutdownRequested_ || userDisconnectRequested_
+        || !config_.automaticReconnect || reconnectTimer_->isActive()) {
+        return;
+    }
+    connectTimeout_->stop();
+    handshakeTimeout_->stop();
+    heartbeatTimer_->stop();
+    const int delay = backoff_.nextDelayMs();
+    ++metrics_.reconnectAttempts;
+    transition(SessionState::Reconnecting,
+               QStringLiteral("%1; retry in %2 ms").arg(reason).arg(delay));
+    reconnectTimer_->start(delay);
+}
+
+void DeviceSession::transition(const SessionState next, QString reason) {
+    if (state_ == next) {
+        return;
+    }
+    state_ = next;
+    qCInfo(tcpSessionLog) << toString(next) << reason;
+    emit stateChanged(next, std::move(reason));
+}
+
+bool DeviceSession::enqueueFrame(const MessageType type, QByteArray payload,
+                                 const TrafficClass trafficClass,
+                                 QString coalescingKey) {
+    Frame frame{type, 0, nextSequence_++, std::move(payload)};
+    QByteArray encoded = FrameCodec::encode(frame);
+    if (encoded.isEmpty()) {
+        ++metrics_.protocolErrors;
+        return false;
+    }
+    const EnqueueResult result = writeQueue_.enqueue(
+        {std::move(encoded), trafficClass, std::move(coalescingKey)});
+    metrics_.queuedMessages = writeQueue_.size();
+    metrics_.queuedBytes = writeQueue_.bytes();
+    metrics_.queueHighWaterBytes = writeQueue_.highWaterBytes();
+    if (result == EnqueueResult::RejectedByteLimit
+        || result == EnqueueResult::RejectedItemLimit) {
+        ++metrics_.rejectedMessages;
+        return false;
+    }
+    ++metrics_.sentFrames;
+    emit frameObserved(QStringLiteral("TX"), type, frame.sequence,
+                       frame.payload.size());
+    pumpWriteQueue();
+    return true;
+}
+
+void DeviceSession::handleFrame(const Frame& frame) {
+    switch (frame.type) {
+    case MessageType::HelloAck:
+        handleHelloAck(frame);
+        break;
+    case MessageType::HeartbeatAck: {
+        QCborParserError error;
+        const QCborValue value = QCborValue::fromCbor(frame.payload, &error);
+        if (error.error == QCborError::NoError && value.isMap()) {
+            const qint64 sentAt = value.toMap().value(QStringLiteral("sentAt")).toInteger();
+            metrics_.lastRoundTripMs = qMax<qint64>(0, monotonicClock_.elapsed() - sentAt);
+        }
+        break;
+    }
+    case MessageType::Telemetry:
+        handleTelemetry(frame);
+        break;
+    case MessageType::CommandReply:
+        handleCommandReply(frame);
+        break;
+    default:
+        emit logMessage(QStringLiteral("protocol"),
+                        QStringLiteral("unexpected %1 in state %2")
+                            .arg(toString(frame.type), toString(state_)));
+        break;
+    }
+}
+
+void DeviceSession::handleHelloAck(const Frame& frame) {
+    Q_UNUSED(frame)
+    if (state_ != SessionState::Handshaking) {
+        ++metrics_.protocolErrors;
+        emit logMessage(QStringLiteral("protocol"),
+                        QStringLiteral("HelloAck outside handshake"));
+        return;
+    }
+    handshakeTimeout_->stop();
+    backoff_.reset();
+    transition(SessionState::Online, QStringLiteral("application handshake complete"));
+    heartbeatTimer_->start();
+}
+
+void DeviceSession::handleTelemetry(const Frame& frame) {
+    QCborParserError error;
+    const QCborValue value = QCborValue::fromCbor(frame.payload, &error);
+    if (error.error != QCborError::NoError || !value.isMap()) {
+        ++metrics_.protocolErrors;
+        emit logMessage(QStringLiteral("protocol"), parserErrorText(error));
+        return;
+    }
+    const QCborMap map = value.toMap();
+    const QCborValue deviceId = map.value(QStringLiteral("deviceId"));
+    const QCborValue capturedAt = map.value(QStringLiteral("capturedAtMs"));
+    const QCborValue temperature = map.value(QStringLiteral("temperatureC"));
+    const QCborValue rpm = map.value(QStringLiteral("spindleRpm"));
+    const QCborValue vibration = map.value(QStringLiteral("vibration"));
+    const QCborValue load = map.value(QStringLiteral("loadPercent"));
+    if (!deviceId.isString() || !capturedAt.isInteger()
+        || !temperature.isDouble() || !rpm.isDouble()
+        || !vibration.isDouble() || !load.isDouble()) {
+        ++metrics_.protocolErrors;
+        emit logMessage(QStringLiteral("protocol"),
+                        QStringLiteral("telemetry payload has missing or invalid fields"));
+        return;
+    }
+    emit telemetryReceived({deviceId.toString(), capturedAt.toInteger(),
+                            temperature.toDouble(), rpm.toDouble(),
+                            vibration.toDouble(), load.toDouble()});
+}
+
+void DeviceSession::handleCommandReply(const Frame& frame) {
+    QCborParserError error;
+    const QCborValue value = QCborValue::fromCbor(frame.payload, &error);
+    if (error.error != QCborError::NoError || !value.isMap()) {
+        ++metrics_.protocolErrors;
+        emit logMessage(QStringLiteral("protocol"), parserErrorText(error));
+        return;
+    }
+    const QCborMap map = value.toMap();
+    const QUuid requestId(map.value(QStringLiteral("requestId")).toString());
+    auto iterator = pending_.find(requestId);
+    if (requestId.isNull() || iterator == pending_.end()) {
+        ++metrics_.protocolErrors;
+        emit logMessage(QStringLiteral("protocol"),
+                        QStringLiteral("late, duplicate, or unknown command reply"));
+        return;
+    }
+    const PendingRequest pending = iterator.value();
+    pending_.erase(iterator);
+    if (pending.connectionGeneration != metrics_.connectionGeneration) {
+        emit logMessage(QStringLiteral("protocol"),
+                        QStringLiteral("discarded reply from an old connection generation"));
+        return;
+    }
+    const bool accepted = map.value(QStringLiteral("accepted")).toBool();
+    emit commandCompleted({requestId,
+                           accepted ? CommandCompletion::Accepted
+                                    : CommandCompletion::Rejected,
+                           map.value(QStringLiteral("detail")).toString(),
+                           pending.connectionGeneration});
+}
+
+void DeviceSession::failPending(const CommandCompletion completion,
+                                const QString& detail) {
+    const auto pendingCopy = pending_;
+    pending_.clear();
+    for (auto iterator = pendingCopy.cbegin(); iterator != pendingCopy.cend(); ++iterator) {
+        emit commandCompleted({iterator.key(), completion,
+                               QStringLiteral("%1; command '%2' execution state unknown")
+                                   .arg(detail, iterator->command),
+                               iterator->connectionGeneration});
+    }
+}
+
+void DeviceSession::publishMetrics() {
+    metrics_.decoderBufferedBytes = decoder_.bufferedBytes();
+    metrics_.queuedMessages = writeQueue_.size();
+    metrics_.queuedBytes = writeQueue_.bytes();
+    metrics_.queueHighWaterBytes = writeQueue_.highWaterBytes();
+    emit metricsChanged(metrics_);
+}
+
+}  // namespace ds::tcp
