@@ -9,8 +9,7 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-find_package(Qt6 6.4 REQUIRED COMPONENTS Core Widgets Network Sql Test)
-qt_standard_project_setup()
+find_package(Qt5 5.15 REQUIRED COMPONENTS Core Widgets Network Sql Test)
 
 add_library(device_core STATIC
     src/domain/Types.cpp
@@ -23,19 +22,13 @@ add_library(device_core STATIC
     src/persistence/DatabaseWorker.h
     src/application/DeviceApplicationService.cpp
     src/application/DeviceApplicationService.h
+    resources.qrc
 )
 
 target_include_directories(device_core PUBLIC src)
-target_link_libraries(device_core PUBLIC Qt6::Core Qt6::Network Qt6::Sql)
+target_link_libraries(device_core PUBLIC Qt5::Core Qt5::Network Qt5::Sql)
 target_compile_options(device_core PRIVATE
     $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wpedantic -Wconversion -Wshadow>
-)
-
-qt_add_resources(device_core device_resources
-    PREFIX "/"
-    FILES
-        config/application.json
-        migrations/001_initial.sql
 )
 
 add_executable(DeviceStudio
@@ -65,17 +58,16 @@ add_executable(DeviceStudio
     src/ui/UiMetrics.h
 )
 
-target_link_libraries(DeviceStudio PRIVATE device_core Qt6::Widgets)
+target_link_libraries(DeviceStudio PRIVATE device_core Qt5::Widgets)
 
 add_executable(DeviceSimulator
     simulator/main.cpp
     simulator/DeviceSimulator.cpp
     simulator/DeviceSimulator.h
 )
-target_link_libraries(DeviceSimulator PRIVATE device_core Qt6::Core Qt6::Network)
+target_link_libraries(DeviceSimulator PRIVATE device_core Qt5::Core Qt5::Network)
 
 include(CTest)
 if(BUILD_TESTING)
     add_subdirectory(tests)
 endif()
-

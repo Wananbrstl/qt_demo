@@ -1,4 +1,4 @@
-#include "simulator/DeviceSimulator.h"
+#include "DeviceSimulator.h"
 
 #include <QCommandLineParser>
 #include <QCoreApplication>

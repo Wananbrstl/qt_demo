@@ -5,6 +5,13 @@
 #include <QSqlQuery>
 #include <QThread>
 #include <QTimer>
+#include <QResource>
+
+// Resources compiled into a static library need one explicit reference so the
+// linker retains the generated qrc object file under Qt 5.
+static void initializeDeviceResources() {
+    Q_INIT_RESOURCE(resources);
+}
 
 namespace ds::persistence {
 
@@ -17,6 +24,7 @@ DatabaseWorker::~DatabaseWorker() = default;
 
 void DatabaseWorker::initialize(QString databasePath) {
     Q_ASSERT(QThread::currentThread() == thread());
+    initializeDeviceResources();
     if (initialized_) {
         emit initialized(true, QStringLiteral("Database already initialized"));
         return;
@@ -54,7 +62,7 @@ void DatabaseWorker::enqueueTelemetry(domain::TelemetrySample sample) {
     }
     // The queue is private to the database thread, so no mutex is needed.
     // A hard limit prevents unbounded growth if persistent storage is failing.
-    constexpr qsizetype maximumPendingSamples = 10000;
+    constexpr int maximumPendingSamples = 10000;
     if (pendingTelemetry_.size() >= maximumPendingSamples) {
         pendingTelemetry_.removeFirst();
         emit logMessage(QStringLiteral("database"),
@@ -187,10 +195,14 @@ bool DatabaseWorker::executeMigrationScript(const QString& script, QString* erro
     // Migration files are controlled project assets. Splitting on semicolons is
     // acceptable for this constrained SQL dialect; production migration tools
     // should use a real parser when scripts contain triggers or semicolons in strings.
-    const QStringList statements = script.split(';', Qt::SkipEmptyParts);
+    const QStringList statements = script.split(';');
     QSqlQuery query(database_);
-    for (const QString& statement : statements) {
-        if (!query.exec(statement.trimmed())) {
+    for (const QString& rawStatement : statements) {
+        const QString statement = rawStatement.trimmed();
+        if (statement.isEmpty()) {
+            continue;
+        }
+        if (!query.exec(statement)) {
             database_.rollback();
             *errorMessage = query.lastError().text();
             return false;

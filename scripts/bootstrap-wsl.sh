@@ -13,9 +13,10 @@ sudo apt-get install -y \
     cmake \
     ninja-build \
     gdb \
-    qt6-base-dev \
-    qt6-base-dev-tools \
-    libqt6sql6-sqlite
+    qtbase5-dev \
+    qtbase5-dev-tools \
+    qt5-qmake \
+    libqt5sql5-sqlite
 
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "${project_root}"

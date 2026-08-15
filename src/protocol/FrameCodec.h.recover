@@ -52,8 +52,8 @@ class FrameCodec final {
 public:
     static constexpr quint32 magic = 0x44535455U;  // ASCII: DSTU
     static constexpr quint16 version = 1;
-    static constexpr qsizetype headerBytes = 24;
-    static constexpr qsizetype checksumOffset = 20;
+    static constexpr int headerBytes = 24;
+    static constexpr int checksumOffset = 20;
 
     [[nodiscard]] static QByteArray encode(const Frame& frame);
     [[nodiscard]] static quint32 crc32(const QByteArray& bytes) noexcept;
@@ -69,18 +69,18 @@ public:
 // and emits only complete, validated frames.
 class FrameDecoder final {
 public:
-    explicit FrameDecoder(qsizetype maximumFrameBytes = 1024 * 1024);
+    explicit FrameDecoder(int maximumFrameBytes = 1024 * 1024);
 
     [[nodiscard]] DecodeBatch append(const QByteArray& bytes);
     void reset();
 
-    [[nodiscard]] qsizetype bufferedBytes() const noexcept { return buffer_.size(); }
+    [[nodiscard]] int bufferedBytes() const noexcept { return buffer_.size(); }
 
 private:
-    [[nodiscard]] qsizetype findMagic() const;
+    [[nodiscard]] int findMagic() const;
 
     QByteArray buffer_;
-    qsizetype maximumFrameBytes_{};
+    int maximumFrameBytes_{};
 };
 
 }  // namespace ds::protocol
