@@ -1,0 +1,121 @@
+#include "protocol/FrameCodec.h"
+
+#include <QCborMap>
+#include <QCborValue>
+#include <QCommandLineParser>
+#include <QCoreApplication>
+#include <QDebug>
+#include <QHostAddress>
+#include <QTcpSocket>
+#include <QTimer>
+
+#include <utility>
+
+// This probe intentionally exposes raw QTcpSocket signals for the first lab,
+// while still using the same bounded production decoder as the workstation.
+class TcpConnectionProbe final : public QObject {
+    Q_OBJECT
+
+public:
+    TcpConnectionProbe(QString host, quint16 port, int timeoutMs,
+                       QObject* parent = nullptr)
+        : QObject(parent), host_(std::move(host)), port_(port) {
+        timeout_.setSingleShot(true);
+        timeout_.setInterval(timeoutMs);
+        connect(&socket_, &QTcpSocket::connected,
+                this, &TcpConnectionProbe::onConnected);
+        connect(&socket_, &QTcpSocket::readyRead,
+                this, &TcpConnectionProbe::onReadyRead);
+        connect(&socket_, &QTcpSocket::disconnected, this, [] {
+            qInfo() << "disconnected";
+        });
+        connect(&socket_, &QTcpSocket::errorOccurred, this,
+                [this](QAbstractSocket::SocketError error) {
+            qWarning() << "socket error" << error << socket_.errorString();
+        });
+        connect(&timeout_, &QTimer::timeout, this, [this] {
+            qCritical() << "probe timeout in state" << socket_.state();
+            socket_.abort();
+            QCoreApplication::exit(3);
+        });
+    }
+
+    void start() {
+        qInfo().noquote() << QStringLiteral("connecting asynchronously to %1:%2")
+                                 .arg(host_).arg(port_);
+        timeout_.start();
+        socket_.connectToHost(host_, port_);
+    }
+
+private:
+    void onConnected() {
+        qInfo() << "TCP connected; peer=" << socket_.peerAddress()
+                << socket_.peerPort();
+        QCborMap hello;
+        hello.insert(QStringLiteral("client"), QStringLiteral("TcpConnectionProbe"));
+        hello.insert(QStringLiteral("protocolVersion"), ds::tcp::FrameCodec::version);
+        const QByteArray encoded = ds::tcp::FrameCodec::encode(
+            {ds::tcp::MessageType::Hello, 0, 1, QCborValue(hello).toCbor()});
+        const qint64 accepted = socket_.write(encoded);
+        qInfo() << "queued Hello bytes=" << accepted
+                << "bytesToWrite=" << socket_.bytesToWrite();
+    }
+
+    void onReadyRead() {
+        const QByteArray bytes = socket_.readAll();
+        qInfo() << "readyRead bytes=" << bytes.size()
+                << "beforeBuffered=" << decoder_.bufferedBytes();
+        const ds::tcp::DecodeBatch batch = decoder_.append(bytes);
+        for (const ds::tcp::DecodeError& error : batch.errors) {
+            qWarning().noquote() << error.detail;
+        }
+        for (const ds::tcp::Frame& frame : batch.frames) {
+            qInfo().noquote() << QStringLiteral("frame type=%1 sequence=%2 payload=%3")
+                                     .arg(ds::tcp::toString(frame.type))
+                                     .arg(frame.sequence)
+                                     .arg(frame.payload.size());
+            if (frame.type == ds::tcp::MessageType::HelloAck) {
+                timeout_.stop();
+                socket_.disconnectFromHost();
+                QCoreApplication::exit(0);
+            }
+        }
+    }
+
+    QString host_;
+    quint16 port_{};
+    QTcpSocket socket_;
+    QTimer timeout_;
+    ds::tcp::StreamFrameDecoder decoder_;
+};
+
+int main(int argc, char* argv[]) {
+    QCoreApplication application(argc, argv);
+    QCoreApplication::setApplicationName(QStringLiteral("TcpConnectionProbe"));
+    QCommandLineParser parser;
+    parser.setApplicationDescription(
+        QStringLiteral("Asynchronous Qt 5 TCP connection and framing probe"));
+    parser.addHelpOption();
+    parser.addOption({QStringLiteral("host"), QStringLiteral("remote host"),
+                      QStringLiteral("host"), QStringLiteral("127.0.0.1")});
+    parser.addOption({QStringLiteral("port"), QStringLiteral("remote port"),
+                      QStringLiteral("port"), QStringLiteral("45455")});
+    parser.addOption({QStringLiteral("timeout"), QStringLiteral("overall timeout ms"),
+                      QStringLiteral("ms"), QStringLiteral("5000")});
+    parser.process(application);
+
+    bool portOk = false;
+    bool timeoutOk = false;
+    const int port = parser.value(QStringLiteral("port")).toInt(&portOk);
+    const int timeout = parser.value(QStringLiteral("timeout")).toInt(&timeoutOk);
+    if (!portOk || port < 1 || port > 65535 || !timeoutOk || timeout < 1) {
+        parser.showHelp(2);
+    }
+
+    TcpConnectionProbe probe(parser.value(QStringLiteral("host")),
+                             static_cast<quint16>(port), timeout);
+    QTimer::singleShot(0, &probe, [&probe] { probe.start(); });
+    return application.exec();
+}
+
+#include "TcpConnectionProbe.moc"

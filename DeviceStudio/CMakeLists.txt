@@ -71,3 +71,9 @@ include(CTest)
 if(BUILD_TESTING)
     add_subdirectory(tests)
 endif()
+
+option(DEVICESTUDIO_BUILD_TCP_LABS
+       "Build the production-style TCP learning laboratory" ON)
+if(DEVICESTUDIO_BUILD_TCP_LABS)
+    add_subdirectory(examples/tcp)
+endif()

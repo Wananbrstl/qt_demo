@@ -1,0 +1,30 @@
+#include "common/BackoffPolicy.h"
+
+#include <algorithm>
+#include <limits>
+
+namespace ds::tcp {
+
+BackoffPolicy::BackoffPolicy(const int baseDelayMs,
+                             const int maximumDelayMs,
+                             const quint32 seed)
+    : baseDelayMs_(std::max(1, baseDelayMs)),
+      maximumDelayMs_(std::max(baseDelayMs_, maximumDelayMs)),
+      random_(seed) {}
+
+int BackoffPolicy::nextDelayMs() {
+    // Saturate before shifting. Undefined shifts and integer overflow in a
+    // reconnect path can otherwise create a tight retry loop during an outage.
+    quint64 exponential = static_cast<quint64>(baseDelayMs_);
+    const quint32 safeShift = std::min<quint32>(attempt_, 31U);
+    exponential <<= safeShift;
+    const int ceiling = static_cast<int>(std::min<quint64>(
+        exponential, static_cast<quint64>(maximumDelayMs_)));
+    std::uniform_int_distribution<int> distribution(0, ceiling);
+    if (attempt_ < std::numeric_limits<quint32>::max()) {
+        ++attempt_;
+    }
+    return distribution(random_);
+}
+
+}  // namespace ds::tcp

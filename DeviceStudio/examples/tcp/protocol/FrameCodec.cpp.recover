@@ -1,0 +1,179 @@
+#include "protocol/FrameCodec.h"
+
+#include <QBuffer>
+#include <QDataStream>
+#include <QtGlobal>
+
+#include <limits>
+
+namespace ds::tcp {
+namespace {
+
+QByteArray encodedMagic() {
+    QByteArray bytes;
+    QDataStream stream(&bytes, QIODevice::WriteOnly);
+    stream.setByteOrder(QDataStream::BigEndian);
+    stream << FrameCodec::magic;
+    return bytes;
+}
+
+}  // namespace
+
+QByteArray FrameCodec::encode(const Frame& frame) {
+    if (static_cast<quint64>(frame.payload.size())
+        > std::numeric_limits<quint32>::max()) {
+        return {};
+    }
+
+    QByteArray prefix;
+    prefix.reserve(checksumOffset + frame.payload.size());
+    QDataStream prefixStream(&prefix, QIODevice::WriteOnly);
+    prefixStream.setByteOrder(QDataStream::BigEndian);
+    prefixStream << magic << version << static_cast<quint16>(frame.type)
+                 << frame.flags << quint16{0} << frame.sequence
+                 << static_cast<quint32>(frame.payload.size());
+
+    const quint32 checksum = crc32(prefix + frame.payload);
+    QByteArray encoded = prefix;
+    QDataStream checksumStream(&encoded, QIODevice::Append);
+    checksumStream.setByteOrder(QDataStream::BigEndian);
+    checksumStream << checksum;
+    encoded.append(frame.payload);
+    return encoded;
+}
+
+quint32 FrameCodec::crc32(const QByteArray& bytes) noexcept {
+    quint32 crc = 0xFFFFFFFFU;
+    for (const char byte : bytes) {
+        crc ^= static_cast<quint8>(byte);
+        for (int bit = 0; bit < 8; ++bit) {
+            const quint32 mask = 0U - (crc & 1U);
+            crc = (crc >> 1U) ^ (0xEDB88320U & mask);
+        }
+    }
+    return ~crc;
+}
+
+StreamFrameDecoder::StreamFrameDecoder(ProtocolLimits limits)
+    : limits_(limits) {
+    limits_.maximumFrameBytes = qMax(limits_.maximumFrameBytes,
+                                     FrameCodec::headerBytes);
+    limits_.maximumBufferedBytes = qMax(limits_.maximumBufferedBytes,
+                                        limits_.maximumFrameBytes);
+}
+
+DecodeBatch StreamFrameDecoder::append(const QByteArray& bytes) {
+    DecodeBatch batch;
+
+    // Reject before append so an attacker cannot force a transient allocation
+    // beyond the configured bound. Clearing is deliberate: once the resource
+    // contract is violated the stream position is no longer trusted.
+    const quint64 combined = static_cast<quint64>(buffer_.size())
+        + static_cast<quint64>(bytes.size());
+    if (combined > static_cast<quint64>(limits_.maximumBufferedBytes)) {
+        const int discarded = buffer_.size();
+        buffer_.clear();
+        batch.errors.push_back({DecodeErrorCode::BufferLimitExceeded,
+                                QStringLiteral("decoder buffer limit exceeded"),
+                                discarded});
+        return batch;
+    }
+    buffer_.append(bytes);
+
+    while (buffer_.size() >= FrameCodec::headerBytes) {
+        const int magicPosition = findMagic();
+        if (magicPosition < 0) {
+            // Keep at most three trailing bytes: they may start the four-byte
+            // magic split over the next TCP read.
+            const int discard = qMax(0, buffer_.size() - 3);
+            discardPrefix(discard, batch,
+                          QStringLiteral("discarded bytes while searching for magic"));
+            break;
+        }
+        if (magicPosition > 0) {
+            discardPrefix(magicPosition, batch,
+                          QStringLiteral("discarded prefix before frame magic"));
+        }
+        if (buffer_.size() < FrameCodec::headerBytes) {
+            break;
+        }
+
+        QBuffer headerBuffer(&buffer_);
+        if (!headerBuffer.open(QIODevice::ReadOnly)) {
+            break;
+        }
+        QDataStream stream(&headerBuffer);
+        stream.setByteOrder(QDataStream::BigEndian);
+
+        quint32 decodedMagic{};
+        quint16 decodedVersion{};
+        quint16 rawType{};
+        quint16 flags{};
+        quint16 reserved{};
+        quint32 sequence{};
+        quint32 payloadSize{};
+        quint32 checksum{};
+        stream >> decodedMagic >> decodedVersion >> rawType >> flags >> reserved
+               >> sequence >> payloadSize >> checksum;
+        Q_UNUSED(decodedMagic)
+        Q_UNUSED(reserved)
+
+        if (decodedVersion != FrameCodec::version) {
+            discardPrefix(4, batch,
+                          QStringLiteral("unsupported protocol version %1")
+                              .arg(decodedVersion));
+            batch.errors.back().code = DecodeErrorCode::UnsupportedVersion;
+            continue;
+        }
+
+        const quint64 total64 = static_cast<quint64>(FrameCodec::headerBytes)
+            + payloadSize;
+        if (total64 > static_cast<quint64>(limits_.maximumFrameBytes)) {
+            discardPrefix(4, batch,
+                          QStringLiteral("declared frame size %1 exceeds limit %2")
+                              .arg(total64)
+                              .arg(limits_.maximumFrameBytes));
+            batch.errors.back().code = DecodeErrorCode::FrameTooLarge;
+            continue;
+        }
+        const int total = static_cast<int>(total64);
+        if (buffer_.size() < total) {
+            break;
+        }
+
+        const QByteArray payload = buffer_.mid(FrameCodec::headerBytes,
+                                               static_cast<int>(payloadSize));
+        const QByteArray checksumInput = buffer_.left(FrameCodec::checksumOffset)
+            + payload;
+        if (FrameCodec::crc32(checksumInput) != checksum) {
+            buffer_.remove(0, total);
+            batch.errors.push_back({DecodeErrorCode::ChecksumMismatch,
+                                    QStringLiteral("CRC mismatch for sequence %1")
+                                        .arg(sequence),
+                                    total});
+            continue;
+        }
+
+        batch.frames.push_back({static_cast<MessageType>(rawType), flags,
+                                sequence, payload});
+        buffer_.remove(0, total);
+    }
+    return batch;
+}
+
+int StreamFrameDecoder::findMagic() const {
+    return buffer_.indexOf(encodedMagic());
+}
+
+void StreamFrameDecoder::discardPrefix(const int count,
+                                       DecodeBatch& batch,
+                                       QString reason) {
+    if (count <= 0) {
+        return;
+    }
+    buffer_.remove(0, count);
+    batch.errors.push_back({DecodeErrorCode::GarbageDiscarded,
+                            std::move(reason), count});
+}
+
+}  // namespace ds::tcp

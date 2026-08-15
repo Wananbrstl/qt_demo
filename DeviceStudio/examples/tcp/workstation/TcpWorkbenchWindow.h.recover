@@ -1,0 +1,73 @@
+#pragma once
+
+#include "common/TcpTypes.h"
+
+#include <QMainWindow>
+#include <QThread>
+
+class QCheckBox;
+class QCloseEvent;
+class QComboBox;
+class QLabel;
+class QLineEdit;
+class QPlainTextEdit;
+class QPushButton;
+class QStandardItemModel;
+class QTableView;
+
+namespace ds::tcp {
+
+class DeviceSession;
+
+// A complete, handwritten upper-computer shell for the TCP course. It owns no
+// socket; every network operation crosses a queued signal/slot boundary.
+class TcpWorkbenchWindow final : public QMainWindow {
+    Q_OBJECT
+
+public:
+    explicit TcpWorkbenchWindow(SessionConfig config, QWidget* parent = nullptr);
+    ~TcpWorkbenchWindow() override;
+
+signals:
+    void connectRequested();
+    void disconnectRequested();
+    void commandRequested(QUuid requestId, QString command,
+                          QByteArray arguments, bool idempotent);
+    void shutdownRequested();
+
+protected:
+    void closeEvent(QCloseEvent* event) override;
+
+private slots:
+    void submitCommand();
+    void onStateChanged(ds::tcp::SessionState state, const QString& reason);
+    void onTelemetry(ds::tcp::TelemetrySample sample);
+    void onCommandResult(ds::tcp::CommandResult result);
+    void onFrame(QString direction, ds::tcp::MessageType type,
+                 quint32 sequence, int payloadBytes);
+    void onMetrics(ds::tcp::SessionMetrics metrics);
+    void appendDiagnostic(const QString& category, const QString& message);
+
+private:
+    void buildUi();
+    void startNetworkWorker();
+
+    SessionConfig config_;
+    QThread networkThread_;
+    DeviceSession* session_{};
+    QLabel* stateValue_{};
+    QLabel* endpointValue_{};
+    QLabel* metricsValue_{};
+    QComboBox* commandBox_{};
+    QLineEdit* argumentsEdit_{};
+    QCheckBox* idempotentCheck_{};
+    QPushButton* connectButton_{};
+    QPushButton* disconnectButton_{};
+    QPushButton* sendButton_{};
+    QTableView* telemetryView_{};
+    QStandardItemModel* telemetryModel_{};
+    QPlainTextEdit* protocolLog_{};
+    bool shutdownStarted_{};
+};
+
+}  // namespace ds::tcp

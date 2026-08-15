@@ -1,0 +1,119 @@
+#include "common/BackoffPolicy.h"
+#include "common/SessionConfigLoader.h"
+#include "transport/BoundedWriteQueue.h"
+
+#include <QTest>
+
+using namespace ds::tcp;
+
+class TcpPolicyTest final : public QObject {
+    Q_OBJECT
+
+private slots:
+    void backoffIsDeterministicAndBounded();
+    void backoffResetRestartsAttemptCounter();
+    void queuePrioritizesControl();
+    void queueRejectsResourceOverflow();
+    void telemetryIsCoalesced();
+    void configurationIsParsedIntoValidatedTypes();
+    void invalidConfigurationIsRejectedAtBoundary();
+};
+
+void TcpPolicyTest::backoffIsDeterministicAndBounded() {
+    BackoffPolicy first(100, 1000, 1234);
+    BackoffPolicy second(100, 1000, 1234);
+    int ceiling = 100;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        const int a = first.nextDelayMs();
+        const int b = second.nextDelayMs();
+        QCOMPARE(a, b);
+        QVERIFY(a >= 0);
+        QVERIFY(a <= ceiling);
+        ceiling = qMin(1000, ceiling * 2);
+    }
+}
+
+void TcpPolicyTest::backoffResetRestartsAttemptCounter() {
+    BackoffPolicy policy(50, 500, 1);
+    (void)policy.nextDelayMs();
+    (void)policy.nextDelayMs();
+    QCOMPARE(policy.attempt(), quint32{2});
+    policy.reset();
+    QCOMPARE(policy.attempt(), quint32{0});
+    QVERIFY(policy.nextDelayMs() <= 50);
+}
+
+void TcpPolicyTest::queuePrioritizesControl() {
+    BoundedWriteQueue queue(8, 1024);
+    QCOMPARE(static_cast<int>(queue.enqueue(
+                 {QByteArrayLiteral("bulk"), TrafficClass::Bulk, {}})),
+             static_cast<int>(EnqueueResult::Accepted));
+    QCOMPARE(static_cast<int>(queue.enqueue(
+                 {QByteArrayLiteral("heartbeat"), TrafficClass::Heartbeat, {}})),
+             static_cast<int>(EnqueueResult::Accepted));
+    QCOMPARE(static_cast<int>(queue.enqueue(
+                 {QByteArrayLiteral("command"), TrafficClass::Control, {}})),
+             static_cast<int>(EnqueueResult::Accepted));
+    QCOMPARE(queue.takeNext()->bytes, QByteArrayLiteral("command"));
+    QCOMPARE(queue.takeNext()->bytes, QByteArrayLiteral("heartbeat"));
+    QCOMPARE(queue.takeNext()->bytes, QByteArrayLiteral("bulk"));
+}
+
+void TcpPolicyTest::queueRejectsResourceOverflow() {
+    BoundedWriteQueue queue(2, 6);
+    QCOMPARE(static_cast<int>(queue.enqueue(
+                 {QByteArrayLiteral("abc"), TrafficClass::Bulk, {}})),
+             static_cast<int>(EnqueueResult::Accepted));
+    QCOMPARE(static_cast<int>(queue.enqueue(
+                 {QByteArrayLiteral("de"), TrafficClass::Bulk, {}})),
+             static_cast<int>(EnqueueResult::Accepted));
+    QCOMPARE(static_cast<int>(queue.enqueue(
+                 {QByteArrayLiteral("f"), TrafficClass::Control, {}})),
+             static_cast<int>(EnqueueResult::RejectedItemLimit));
+    BoundedWriteQueue byteQueue(4, 4);
+    QCOMPARE(static_cast<int>(byteQueue.enqueue(
+                 {QByteArrayLiteral("12345"), TrafficClass::Control, {}})),
+             static_cast<int>(EnqueueResult::RejectedByteLimit));
+}
+
+void TcpPolicyTest::telemetryIsCoalesced() {
+    BoundedWriteQueue queue(4, 64);
+    QCOMPARE(static_cast<int>(queue.enqueue(
+                 {QByteArrayLiteral("old"), TrafficClass::Telemetry,
+                  QStringLiteral("temperature")})),
+             static_cast<int>(EnqueueResult::Accepted));
+    QCOMPARE(static_cast<int>(queue.enqueue(
+                 {QByteArrayLiteral("fresh"), TrafficClass::Telemetry,
+                  QStringLiteral("temperature")})),
+             static_cast<int>(EnqueueResult::Coalesced));
+    QCOMPARE(queue.size(), 1);
+    QCOMPARE(queue.takeNext()->bytes, QByteArrayLiteral("fresh"));
+}
+
+void TcpPolicyTest::configurationIsParsedIntoValidatedTypes() {
+    const auto loaded = SessionConfigLoader::fromJson(R"json(
+        {
+          "endpoint": {"host": "10.1.2.3", "port": 5000},
+          "timing": {"heartbeatIntervalMs": 1000, "silenceTimeoutMs": 4000},
+          "queue": {"maximumMessages": 32}
+        }
+    )json");
+    QVERIFY2(loaded.succeeded(), qPrintable(loaded.error));
+    QCOMPARE(loaded.config.endpoint.host, QStringLiteral("10.1.2.3"));
+    QCOMPARE(loaded.config.endpoint.port, quint16{5000});
+    QCOMPARE(loaded.config.maximumQueuedMessages, 32);
+}
+
+void TcpPolicyTest::invalidConfigurationIsRejectedAtBoundary() {
+    const auto loaded = SessionConfigLoader::fromJson(R"json(
+        {
+          "endpoint": {"host": "127.0.0.1", "port": 70000},
+          "timing": {"heartbeatIntervalMs": 5000, "silenceTimeoutMs": 1000}
+        }
+    )json");
+    QVERIFY(!loaded.succeeded());
+    QVERIFY(!loaded.error.isEmpty());
+}
+
+QTEST_APPLESS_MAIN(TcpPolicyTest)
+#include "test_policies.moc"

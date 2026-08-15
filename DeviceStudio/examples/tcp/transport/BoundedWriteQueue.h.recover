@@ -1,0 +1,55 @@
+#pragma once
+
+#include <QByteArray>
+#include <QList>
+#include <QString>
+
+#include <optional>
+
+namespace ds::tcp {
+
+enum class TrafficClass : quint8 {
+    Control,
+    Heartbeat,
+    Telemetry,
+    Bulk
+};
+
+struct OutboundMessage final {
+    QByteArray bytes;
+    TrafficClass trafficClass{TrafficClass::Bulk};
+    QString coalescingKey;
+};
+
+enum class EnqueueResult : quint8 {
+    Accepted,
+    Coalesced,
+    RejectedItemLimit,
+    RejectedByteLimit
+};
+
+// Bounded application queue. QTcpSocket has its own write buffer, but relying on
+// it alone only moves an unbounded-growth problem one layer down.
+class BoundedWriteQueue final {
+public:
+    BoundedWriteQueue(int maximumItems, int maximumBytes);
+
+    [[nodiscard]] EnqueueResult enqueue(OutboundMessage message);
+    [[nodiscard]] std::optional<OutboundMessage> takeNext();
+    void clear() noexcept;
+
+    [[nodiscard]] int size() const noexcept { return messages_.size(); }
+    [[nodiscard]] int bytes() const noexcept { return bytes_; }
+    [[nodiscard]] int highWaterBytes() const noexcept { return highWaterBytes_; }
+
+private:
+    [[nodiscard]] int nextIndex() const noexcept;
+
+    QList<OutboundMessage> messages_;
+    int maximumItems_{};
+    int maximumBytes_{};
+    int bytes_{};
+    int highWaterBytes_{};
+};
+
+}  // namespace ds::tcp

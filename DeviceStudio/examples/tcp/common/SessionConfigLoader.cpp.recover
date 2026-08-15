@@ -1,0 +1,142 @@
+#include "common/SessionConfigLoader.h"
+
+#include <QFile>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonParseError>
+
+#include <limits>
+
+namespace ds::tcp {
+namespace {
+
+bool readInt(const QJsonObject& object, const QString& key,
+             int* destination, QString* error) {
+    if (!object.contains(key)) {
+        return true;  // Missing optional values retain typed defaults.
+    }
+    const QJsonValue value = object.value(key);
+    if (!value.isDouble()) {
+        *error = QStringLiteral("%1 must be an integer").arg(key);
+        return false;
+    }
+    const double raw = value.toDouble();
+    const int converted = value.toInt(std::numeric_limits<int>::min());
+    if (raw != static_cast<double>(converted)) {
+        *error = QStringLiteral("%1 is outside the integer range").arg(key);
+        return false;
+    }
+    *destination = converted;
+    return true;
+}
+
+QJsonObject childObject(const QJsonObject& root, const QString& key,
+                        QString* error) {
+    const QJsonValue value = root.value(key);
+    if (value.isUndefined()) {
+        return {};
+    }
+    if (!value.isObject()) {
+        *error = QStringLiteral("%1 must be an object").arg(key);
+        return {};
+    }
+    return value.toObject();
+}
+
+}  // namespace
+
+SessionConfigLoadResult SessionConfigLoader::fromJson(const QByteArray& json) {
+    SessionConfigLoadResult result;
+    QJsonParseError parseError;
+    const QJsonDocument document = QJsonDocument::fromJson(json, &parseError);
+    if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
+        result.error = QStringLiteral("invalid JSON at offset %1: %2")
+            .arg(parseError.offset)
+            .arg(parseError.errorString());
+        return result;
+    }
+
+    const QJsonObject root = document.object();
+    QString error;
+    const QJsonObject endpoint = childObject(root, QStringLiteral("endpoint"), &error);
+    if (!error.isEmpty()) {
+        result.error = error;
+        return result;
+    }
+    if (endpoint.contains(QStringLiteral("host"))) {
+        if (!endpoint.value(QStringLiteral("host")).isString()) {
+            result.error = QStringLiteral("endpoint.host must be a string");
+            return result;
+        }
+        result.config.endpoint.host = endpoint.value(QStringLiteral("host")).toString();
+    }
+    int port = result.config.endpoint.port;
+    if (!readInt(endpoint, QStringLiteral("port"), &port, &error)
+        || port < 1 || port > 65535) {
+        result.error = error.isEmpty()
+            ? QStringLiteral("endpoint.port must be in [1, 65535]") : error;
+        return result;
+    }
+    result.config.endpoint.port = static_cast<quint16>(port);
+
+    const QJsonObject protocol = childObject(root, QStringLiteral("protocol"), &error);
+    const QJsonObject timing = childObject(root, QStringLiteral("timing"), &error);
+    const QJsonObject reconnect = childObject(root, QStringLiteral("reconnect"), &error);
+    const QJsonObject queue = childObject(root, QStringLiteral("queue"), &error);
+    if (!error.isEmpty()) {
+        result.error = error;
+        return result;
+    }
+
+    if (!readInt(protocol, QStringLiteral("maximumFrameBytes"),
+                 &result.config.protocol.maximumFrameBytes, &error)
+        || !readInt(protocol, QStringLiteral("maximumBufferedBytes"),
+                    &result.config.protocol.maximumBufferedBytes, &error)
+        || !readInt(timing, QStringLiteral("connectTimeoutMs"),
+                    &result.config.connectTimeoutMs, &error)
+        || !readInt(timing, QStringLiteral("handshakeTimeoutMs"),
+                    &result.config.handshakeTimeoutMs, &error)
+        || !readInt(timing, QStringLiteral("heartbeatIntervalMs"),
+                    &result.config.heartbeatIntervalMs, &error)
+        || !readInt(timing, QStringLiteral("silenceTimeoutMs"),
+                    &result.config.silenceTimeoutMs, &error)
+        || !readInt(timing, QStringLiteral("requestTimeoutMs"),
+                    &result.config.requestTimeoutMs, &error)
+        || !readInt(reconnect, QStringLiteral("baseDelayMs"),
+                    &result.config.reconnectBaseMs, &error)
+        || !readInt(reconnect, QStringLiteral("maximumDelayMs"),
+                    &result.config.reconnectMaximumMs, &error)
+        || !readInt(queue, QStringLiteral("maximumMessages"),
+                    &result.config.maximumQueuedMessages, &error)
+        || !readInt(queue, QStringLiteral("maximumBytes"),
+                    &result.config.maximumQueuedBytes, &error)
+        || !readInt(queue, QStringLiteral("socketWriteHighWaterBytes"),
+                    &result.config.socketWriteHighWaterBytes, &error)) {
+        result.error = error;
+        return result;
+    }
+    if (reconnect.contains(QStringLiteral("automatic"))) {
+        if (!reconnect.value(QStringLiteral("automatic")).isBool()) {
+            result.error = QStringLiteral("reconnect.automatic must be boolean");
+            return result;
+        }
+        result.config.automaticReconnect =
+            reconnect.value(QStringLiteral("automatic")).toBool();
+    }
+
+    result.error = result.config.validate();
+    return result;
+}
+
+SessionConfigLoadResult SessionConfigLoader::fromFile(const QString& path) {
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        SessionConfigLoadResult result;
+        result.error = QStringLiteral("cannot open %1: %2")
+            .arg(path, file.errorString());
+        return result;
+    }
+    return fromJson(file.readAll());
+}
+
+}  // namespace ds::tcp
