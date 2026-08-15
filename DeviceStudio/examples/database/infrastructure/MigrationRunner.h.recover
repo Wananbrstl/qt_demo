@@ -1,0 +1,25 @@
+#pragma once
+
+#include "common/DbTypes.h"
+
+#include <QStringList>
+#include <QVector>
+
+namespace ds::database {
+
+class DatabaseSession;
+
+struct Migration final {
+    int version{};
+    QString name;
+    QStringList statements;
+};
+
+class MigrationRunner final {
+public:
+    [[nodiscard]] static OperationResult apply(DatabaseSession& session,
+                                               const QVector<Migration>& migrations);
+    [[nodiscard]] static QString checksum(const Migration& migration);
+};
+
+}  // namespace ds::database

@@ -1,0 +1,157 @@
+#include "workers/MysqlSyncWorker.h"
+
+#include "infrastructure/DatabaseSession.h"
+#include "infrastructure/MigrationRunner.h"
+#include "repositories/HistorianRepository.h"
+#include "schema/HistorianSchema.h"
+
+#include <QDateTime>
+#include <QStringList>
+#include <QThread>
+
+#include <utility>
+
+namespace ds::database {
+
+MysqlSyncWorker::MysqlSyncWorker(QObject* parent) : QObject(parent) {}
+MysqlSyncWorker::~MysqlSyncWorker() = default;
+
+void MysqlSyncWorker::initialize(MysqlConfig config) {
+    Q_ASSERT(QThread::currentThread() == thread());
+    if (initialized_) {
+        emit initialized(true, QStringLiteral("MySQL synchronizer already initialized"));
+        return;
+    }
+    config_ = std::move(config);
+    initialized_ = true;
+    if (!config_.enabled) {
+        emit initialized(true, QStringLiteral("MySQL synchronization is disabled"));
+        return;
+    }
+
+    const OperationResult result = ensureConnection();
+    // A central database outage is a degraded mode, not a local historian
+    // startup failure. Outbox retries will reconnect later.
+    emit initialized(true, result.succeeded()
+                               ? QStringLiteral("MySQL synchronizer ready")
+                               : QStringLiteral("MySQL unavailable; local outbox will retry: %1")
+                                     .arg(result.error.diagnosticText()));
+}
+
+void MysqlSyncWorker::synchronize(QVector<OutboxEvent> events) {
+    Q_ASSERT(QThread::currentThread() == thread());
+    if (events.isEmpty()) {
+        emit batchSucceeded({});
+        return;
+    }
+    if (!initialized_ || shuttingDown_ || !config_.enabled) {
+        emit batchFailed(std::move(events),
+                         QStringLiteral("MySQL synchronizer is not available"));
+        return;
+    }
+
+    QVector<TelemetryRecord> records;
+    QVector<OutboxEvent> validEvents;
+    EventIdList rejectedIds;
+    QStringList rejectionReasons;
+    records.reserve(events.size());
+    validEvents.reserve(events.size());
+    for (const OutboxEvent& event : events) {
+        if (event.eventType != QStringLiteral("telemetry")) {
+            rejectedIds.push_back(event.eventId);
+            rejectionReasons.push_back(QStringLiteral("unsupported type '%1'")
+                                           .arg(event.eventType));
+            continue;
+        }
+        ValueResult<TelemetryRecord> decoded =
+            HistorianRepository::decodeTelemetry(event.payload);
+        if (!decoded.succeeded()) {
+            rejectedIds.push_back(event.eventId);
+            rejectionReasons.push_back(decoded.error.diagnosticText());
+            continue;
+        }
+        records.push_back(std::move(*decoded.value));
+        validEvents.push_back(event);
+    }
+    if (!rejectedIds.isEmpty()) {
+        emit payloadRejected(std::move(rejectedIds), rejectionReasons.join(QStringLiteral(" | ")));
+    }
+    if (records.isEmpty()) {
+        // This terminal acknowledgement only releases the single in-flight
+        // slot. Invalid entries were already moved to the dead-letter state.
+        emit batchSucceeded({});
+        return;
+    }
+
+    OperationResult result = ensureConnection();
+    if (!result.succeeded()) {
+        emit batchFailed(std::move(validEvents), result.error.diagnosticText());
+        return;
+    }
+    result = repository_->persistCentralBatch(records);
+    if (!result.succeeded()) {
+        if (result.error.category == DbErrorCategory::Connection) discardConnection();
+        emit batchFailed(std::move(validEvents), result.error.diagnosticText());
+        return;
+    }
+
+    EventIdList synchronized;
+    synchronized.reserve(validEvents.size());
+    for (const OutboxEvent& event : validEvents) synchronized.push_back(event.eventId);
+    emit batchSucceeded(std::move(synchronized));
+}
+
+void MysqlSyncWorker::shutdown() {
+    Q_ASSERT(QThread::currentThread() == thread());
+    if (shuttingDown_) return;
+    shuttingDown_ = true;
+    discardConnection();
+    initialized_ = false;
+    emit finished();
+}
+
+OperationResult MysqlSyncWorker::ensureConnection() {
+    if (session_ && session_->isOpen() && repository_) {
+        return OperationResult::success();
+    }
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (now < nextConnectionAttemptMs_) {
+        return OperationResult::failure({DbErrorCategory::Connection,
+                                         QStringLiteral("back off MySQL reconnect"),
+                                         QStringLiteral("next connection attempt is delayed"),
+                                         {}, {}, true});
+    }
+
+    discardConnection();
+    session_ = std::make_unique<DatabaseSession>(DatabaseBackend::MySQL,
+                                                 QStringLiteral("outbox-sync"));
+    OperationResult result = session_->open(config_);
+    if (result.succeeded()) {
+        result = MigrationRunner::apply(*session_, HistorianSchema::mysqlMigrations());
+    }
+    if (!result.succeeded()) {
+        nextConnectionAttemptMs_ = now + 5000;
+        emit onlineChanged(false);
+        emit logMessage(QStringLiteral("mysql"), result.error.diagnosticText());
+        discardConnection();
+        return result;
+    }
+
+    repository_ = std::make_unique<HistorianRepository>(*session_);
+    nextConnectionAttemptMs_ = 0;
+    emit onlineChanged(true);
+    emit logMessage(QStringLiteral("mysql"),
+                    QStringLiteral("connected to MySQL %1 at %2:%3")
+                        .arg(session_->engineVersion(), config_.host)
+                        .arg(config_.port));
+    return OperationResult::success();
+}
+
+void MysqlSyncWorker::discardConnection() {
+    repository_.reset();
+    if (session_) session_->close();
+    session_.reset();
+    emit onlineChanged(false);
+}
+
+}  // namespace ds::database

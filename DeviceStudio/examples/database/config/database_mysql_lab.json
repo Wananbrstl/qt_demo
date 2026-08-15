@@ -1,0 +1,32 @@
+{
+  "sqlite": {
+    "path": "device-history.db",
+    "busyTimeoutMs": 3000,
+    "walAutoCheckpointPages": 1000,
+    "enableWal": true,
+    "synchronousFull": false
+  },
+  "mysql": {
+    "enabled": true,
+    "host": "127.0.0.1",
+    "port": 3306,
+    "database": "device_history",
+    "user": "device_app",
+    "passwordEnvironment": "DEVICESTUDIO_MYSQL_PASSWORD",
+    "connectTimeoutSeconds": 5,
+    "readTimeoutSeconds": 10,
+    "writeTimeoutSeconds": 10,
+    "sslCa": "",
+    "sslCertificate": "",
+    "sslKey": ""
+  },
+  "batching": {
+    "flushIntervalMs": 250,
+    "maximumBatchRows": 500,
+    "maximumPendingSamples": 10000
+  },
+  "synchronization": {
+    "intervalMs": 1000,
+    "batchRows": 200
+  }
+}

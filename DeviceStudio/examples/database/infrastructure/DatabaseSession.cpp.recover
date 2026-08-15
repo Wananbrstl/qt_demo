@@ -1,0 +1,241 @@
+#include "infrastructure/DatabaseSession.h"
+
+#include <QSqlError>
+#include <QSqlQuery>
+#include <QThread>
+#include <QUuid>
+#include <QVariant>
+
+namespace ds::database {
+namespace {
+
+DbErrorCategory categoryFor(const DatabaseBackend backend,
+                            const QString& nativeCode,
+                            const QSqlError::ErrorType type) {
+    bool numericOk = false;
+    const int numeric = nativeCode.toInt(&numericOk);
+    if (backend == DatabaseBackend::SQLite && numericOk) {
+        if (numeric == 5 || numeric == 6) return DbErrorCategory::Busy;
+        if (numeric == 13) return DbErrorCategory::Storage;
+        if (numeric == 19) return DbErrorCategory::Constraint;
+    }
+    if (backend == DatabaseBackend::MySQL && numericOk) {
+        if (numeric == 1205) return DbErrorCategory::Timeout;
+        if (numeric == 1213) return DbErrorCategory::Deadlock;
+        if (numeric == 1062 || numeric == 1451 || numeric == 1452) {
+            return DbErrorCategory::Constraint;
+        }
+        if (numeric == 2002 || numeric == 2003 || numeric == 2006
+            || numeric == 2013) {
+            return DbErrorCategory::Connection;
+        }
+    }
+    switch (type) {
+    case QSqlError::ConnectionError: return DbErrorCategory::Connection;
+    case QSqlError::StatementError: return DbErrorCategory::Query;
+    case QSqlError::TransactionError: return DbErrorCategory::Query;
+    case QSqlError::UnknownError: return DbErrorCategory::Unknown;
+    case QSqlError::NoError: return DbErrorCategory::None;
+    }
+    return DbErrorCategory::Unknown;
+}
+
+bool retryable(const DbErrorCategory category) {
+    return category == DbErrorCategory::Busy
+        || category == DbErrorCategory::Deadlock
+        || category == DbErrorCategory::Timeout
+        || category == DbErrorCategory::Connection;
+}
+
+}  // namespace
+
+DatabaseSession::DatabaseSession(const DatabaseBackend backend, QString role)
+    : backend_(backend), role_(std::move(role)),
+      connectionName_(QStringLiteral("database-lab-%1-%2")
+                          .arg(role_, QUuid::createUuid().toString(QUuid::WithoutBraces))) {}
+
+DatabaseSession::~DatabaseSession() {
+    // Normal owners call close() from the worker thread. Do not attempt a
+    // cross-thread Qt SQL cleanup from a destructor running in the wrong thread.
+    if (isOwnerThread()) close();
+}
+
+OperationResult DatabaseSession::open(const SqliteConfig& config) {
+    if (database_.isValid()) {
+        return OperationResult::failure(configurationError(
+            QStringLiteral("open SQLite"), QStringLiteral("session is already open")));
+    }
+    ownerThread_ = QThread::currentThread();
+    database_ = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connectionName_);
+    if (!database_.isValid()) {
+        close();
+        DbError error{DbErrorCategory::DriverUnavailable, QStringLiteral("load QSQLITE"),
+                      QStringLiteral("QSQLITE plugin is unavailable"), {}, {}, false};
+        return OperationResult::failure(std::move(error));
+    }
+    database_.setDatabaseName(config.path);
+    database_.setConnectOptions(QStringLiteral("QSQLITE_BUSY_TIMEOUT=%1")
+                                    .arg(config.busyTimeoutMs));
+    if (!database_.open()) {
+        const DbError error = errorFrom(database_.lastError(), QStringLiteral("open SQLite"));
+        close();
+        return OperationResult::failure(error);
+    }
+
+    auto result = executeRequired(QStringLiteral("PRAGMA foreign_keys=ON"),
+                                  QStringLiteral("enable SQLite foreign keys"));
+    if (!result.succeeded()) {
+        close();
+        return result;
+    }
+    result = executeRequired(QStringLiteral("PRAGMA synchronous=%1")
+                                 .arg(config.synchronousFull ? QStringLiteral("FULL")
+                                                             : QStringLiteral("NORMAL")),
+                             QStringLiteral("configure SQLite synchronous"));
+    if (!result.succeeded()) {
+        close();
+        return result;
+    }
+    if (config.enableWal && config.path != QStringLiteral(":memory:")) {
+        QSqlQuery query(database_);
+        if (!query.exec(QStringLiteral("PRAGMA journal_mode=WAL")) || !query.next()
+            || query.value(0).toString().compare(QStringLiteral("wal"), Qt::CaseInsensitive) != 0) {
+            const DbError error = query.lastError().isValid()
+                ? errorFrom(query.lastError(), QStringLiteral("enable SQLite WAL"))
+                : configurationError(QStringLiteral("enable SQLite WAL"),
+                                     QStringLiteral("journal_mode did not become WAL"));
+            close();
+            return OperationResult::failure(error);
+        }
+        result = executeRequired(QStringLiteral("PRAGMA wal_autocheckpoint=%1")
+                                     .arg(config.walAutoCheckpointPages),
+                                 QStringLiteral("configure SQLite checkpoint"));
+        if (!result.succeeded()) {
+            close();
+            return result;
+        }
+    }
+    return OperationResult::success();
+}
+
+OperationResult DatabaseSession::open(const MysqlConfig& config) {
+    if (database_.isValid()) {
+        return OperationResult::failure(configurationError(
+            QStringLiteral("open MySQL"), QStringLiteral("session is already open")));
+    }
+    if (!config.enabled) {
+        return OperationResult::failure(configurationError(
+            QStringLiteral("open MySQL"), QStringLiteral("MySQL is disabled")));
+    }
+    ownerThread_ = QThread::currentThread();
+    database_ = QSqlDatabase::addDatabase(QStringLiteral("QMYSQL"), connectionName_);
+    if (!database_.isValid()) {
+        close();
+        DbError error{DbErrorCategory::DriverUnavailable, QStringLiteral("load QMYSQL"),
+                      QStringLiteral("QMYSQL plugin is unavailable"), {}, {}, false};
+        return OperationResult::failure(std::move(error));
+    }
+    database_.setHostName(config.host);
+    database_.setPort(config.port);
+    database_.setDatabaseName(config.database);
+    QStringList options{
+        QStringLiteral("MYSQL_OPT_CONNECT_TIMEOUT=%1").arg(config.connectTimeoutSeconds),
+        QStringLiteral("MYSQL_OPT_READ_TIMEOUT=%1").arg(config.readTimeoutSeconds),
+        QStringLiteral("MYSQL_OPT_WRITE_TIMEOUT=%1").arg(config.writeTimeoutSeconds),
+        QStringLiteral("MYSQL_OPT_RECONNECT=FALSE")};
+    if (!config.sslCa.isEmpty()) options << QStringLiteral("SSL_CA=%1").arg(config.sslCa);
+    if (!config.sslCertificate.isEmpty()) {
+        options << QStringLiteral("SSL_CERT=%1").arg(config.sslCertificate);
+    }
+    if (!config.sslKey.isEmpty()) options << QStringLiteral("SSL_KEY=%1").arg(config.sslKey);
+    database_.setConnectOptions(options.join(QLatin1Char(';')));
+
+    const QByteArray password = qgetenv(config.passwordEnvironment.toUtf8().constData());
+    if (password.isEmpty()) {
+        const DbError error = configurationError(
+            QStringLiteral("read MySQL credential"),
+            QStringLiteral("environment variable %1 is empty")
+                .arg(config.passwordEnvironment));
+        close();
+        return OperationResult::failure(error);
+    }
+    if (!database_.open(config.user, QString::fromUtf8(password))) {
+        const DbError error = errorFrom(database_.lastError(), QStringLiteral("open MySQL"));
+        close();
+        return OperationResult::failure(error);
+    }
+    auto result = executeRequired(QStringLiteral("SET time_zone = '+00:00'"),
+                                  QStringLiteral("set MySQL UTC session"));
+    if (!result.succeeded()) {
+        close();
+        return result;
+    }
+    result = executeRequired(
+        QStringLiteral("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED"),
+        QStringLiteral("set MySQL isolation"));
+    if (!result.succeeded()) close();
+    return result;
+}
+
+void DatabaseSession::close() {
+    if (!database_.isValid()) {
+        database_ = {};
+        if (QSqlDatabase::contains(connectionName_)) {
+            QSqlDatabase::removeDatabase(connectionName_);
+        }
+        ownerThread_ = nullptr;
+        return;
+    }
+    Q_ASSERT(isOwnerThread());
+    database_.close();
+    database_ = {};
+    QSqlDatabase::removeDatabase(connectionName_);
+    ownerThread_ = nullptr;
+}
+
+bool DatabaseSession::isOpen() const {
+    return database_.isValid() && database_.isOpen();
+}
+
+QSqlDatabase DatabaseSession::database() const {
+    Q_ASSERT(isOwnerThread());
+    return database_;
+}
+
+QString DatabaseSession::engineVersion() const {
+    if (!isOpen() || !isOwnerThread()) return {};
+    QSqlQuery query(database_);
+    const QString sql = backend_ == DatabaseBackend::SQLite
+        ? QStringLiteral("SELECT sqlite_version()")
+        : QStringLiteral("SELECT VERSION()");
+    return query.exec(sql) && query.next() ? query.value(0).toString() : QString{};
+}
+
+DbError DatabaseSession::errorFrom(const QSqlError& error,
+                                   QString operation) const {
+    const DbErrorCategory category = categoryFor(backend_, error.nativeErrorCode(),
+                                                 error.type());
+    return {category, std::move(operation), error.driverText(), error.databaseText(),
+            error.nativeErrorCode(), retryable(category)};
+}
+
+DbError DatabaseSession::configurationError(QString operation,
+                                            QString detail) const {
+    return {DbErrorCategory::Configuration, std::move(operation), std::move(detail),
+            {}, {}, false};
+}
+
+OperationResult DatabaseSession::executeRequired(QString statement,
+                                                 QString operation) {
+    QSqlQuery query(database_);
+    if (!query.exec(std::move(statement))) {
+        return OperationResult::failure(errorFrom(query.lastError(), std::move(operation)));
+    }
+    return OperationResult::success();
+}
+
+bool DatabaseSession::isOwnerThread() const noexcept {
+    return ownerThread_ == nullptr || ownerThread_ == QThread::currentThread();
+}
+
+}  // namespace ds::database

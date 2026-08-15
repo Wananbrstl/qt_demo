@@ -1,0 +1,44 @@
+#include "infrastructure/TransactionGuard.h"
+
+#include "infrastructure/DatabaseSession.h"
+
+#include <QSqlError>
+
+namespace ds::database {
+
+TransactionGuard::TransactionGuard(DatabaseSession& session, QString operation)
+    : session_(session), database_(session.database()), operation_(std::move(operation)) {
+    began_ = database_.transaction();
+    if (!began_) {
+        error_ = session_.errorFrom(database_.lastError(), operation_ + QStringLiteral(" begin"));
+    }
+}
+
+TransactionGuard::~TransactionGuard() {
+    if (began_ && !completed_) database_.rollback();
+}
+
+OperationResult TransactionGuard::commit() {
+    if (!began_) return OperationResult::failure(error_);
+    if (completed_) {
+        return OperationResult::failure(session_.configurationError(
+            operation_, QStringLiteral("transaction is already complete")));
+    }
+    if (!database_.commit()) {
+        error_ = session_.errorFrom(database_.lastError(), operation_ + QStringLiteral(" commit"));
+        database_.rollback();
+        completed_ = true;
+        return OperationResult::failure(error_);
+    }
+    completed_ = true;
+    return OperationResult::success();
+}
+
+void TransactionGuard::rollback() {
+    if (began_ && !completed_) {
+        database_.rollback();
+        completed_ = true;
+    }
+}
+
+}  // namespace ds::database

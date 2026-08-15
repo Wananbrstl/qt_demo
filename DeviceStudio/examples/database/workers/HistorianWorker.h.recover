@@ -1,0 +1,66 @@
+#pragma once
+
+#include "common/DbTypes.h"
+
+#include <QObject>
+#include <QQueue>
+
+#include <memory>
+
+class QTimer;
+
+namespace ds::database {
+
+class DatabaseSession;
+class HistorianRepository;
+
+// Serialized SQLite writer. MySQL deliberately belongs to a different worker:
+// a remote timeout must never stall durable local ingestion.
+class HistorianWorker final : public QObject {
+    Q_OBJECT
+
+public:
+    explicit HistorianWorker(QObject* parent = nullptr);
+    ~HistorianWorker() override;
+
+public slots:
+    void initialize(ds::database::HistorianConfig config);
+    void enqueueTelemetry(ds::database::TelemetryRecord record);
+    void queryHistory(ds::database::HistoryQuery query);
+    void flushNow();
+    void synchronizeNow();
+    void markSynchronized(ds::database::EventIdList eventIds);
+    void postponeSynchronization(QVector<ds::database::OutboxEvent> events,
+                                 QString diagnostic);
+    void deadLetterPartial(ds::database::EventIdList eventIds, QString diagnostic);
+    void setMysqlOnline(bool online);
+    void shutdown();
+
+signals:
+    void initialized(bool success, QString message);
+    void historyReady(ds::database::HistoryQuery query,
+                      ds::database::HistoryPage page,
+                      ds::database::DbError error);
+    void metricsChanged(ds::database::HistorianMetrics metrics);
+    void logMessage(QString category, QString message);
+    void outboxBatchReady(QVector<ds::database::OutboxEvent> events);
+    void finished();
+
+private:
+    void flushLocalBatch();
+    void synchronizeOutboxBatch();
+    void publishMetrics();
+
+    HistorianConfig config_;
+    std::unique_ptr<DatabaseSession> localSession_;
+    std::unique_ptr<HistorianRepository> localRepository_;
+    QTimer* flushTimer_{};
+    QTimer* syncTimer_{};
+    QQueue<TelemetryRecord> pending_;
+    HistorianMetrics metrics_;
+    bool synchronizationInFlight_{};
+    bool initialized_{};
+    bool shuttingDown_{};
+};
+
+}  // namespace ds::database

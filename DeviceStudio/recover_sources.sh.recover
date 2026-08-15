@@ -11,5 +11,11 @@ while IFS= read -r -d '' source_file; do
     install -D -m 0644 "${source_file}" "${target_file}"
 done < <(find "${source_root}" -type f \( -name '*.h.recover' -o -name '*.cpp.recover' \) -print0)
 
+# Build manifests are regular files in the repository, but the WSL validation
+# tree must receive them together with recovered source files.
+for relative_path in CMakeLists.txt examples/tcp/CMakeLists.txt examples/database/CMakeLists.txt; do
+    install -D -m 0644 "${source_root}/${relative_path}" "${target_root}/${relative_path}"
+done
+
 echo "Recovered source files:"
 find "${target_root}" -type f \( -name '*.h' -o -name '*.cpp' \) | sort

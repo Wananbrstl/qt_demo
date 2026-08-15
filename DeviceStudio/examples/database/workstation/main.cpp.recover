@@ -1,0 +1,45 @@
+#include "common/DatabaseConfigLoader.h"
+#include "common/DbTypes.h"
+#include "workstation/DatabaseWorkbenchWindow.h"
+
+#include <QApplication>
+#include <QCommandLineParser>
+#include <QDebug>
+#include <QTimer>
+
+int main(int argc, char* argv[]) {
+    QApplication application(argc, argv);
+    QCoreApplication::setApplicationName(QStringLiteral("DatabaseWorkbench"));
+    QCoreApplication::setOrganizationName(QStringLiteral("DeviceStudioLearning"));
+    ds::database::registerDatabaseMetaTypes();
+
+    QCommandLineParser parser;
+    parser.setApplicationDescription(
+        QStringLiteral("Industrial SQLite and MySQL laboratory for Qt 5.15"));
+    parser.addHelpOption();
+    parser.addOption({QStringLiteral("config"), QStringLiteral("database JSON config"),
+                      QStringLiteral("path"),
+                      QStringLiteral("examples/database/config/database_lab.json")});
+    parser.addOption({QStringLiteral("exit-after-ms"),
+                      QStringLiteral("close automatically (headless smoke tests)"),
+                      QStringLiteral("milliseconds")});
+    parser.process(application);
+    const auto loaded = ds::database::DatabaseConfigLoader::fromFile(
+        parser.value(QStringLiteral("config")));
+    if (!loaded.succeeded()) {
+        qCritical().noquote() << loaded.error;
+        return 2;
+    }
+    ds::database::DatabaseWorkbenchWindow window(loaded.config);
+    window.show();
+    if (parser.isSet(QStringLiteral("exit-after-ms"))) {
+        bool ok = false;
+        const int delay = parser.value(QStringLiteral("exit-after-ms")).toInt(&ok);
+        if (!ok || delay < 1) {
+            qCritical() << "--exit-after-ms must be a positive integer";
+            return 2;
+        }
+        QTimer::singleShot(delay, &window, &QWidget::close);
+    }
+    return application.exec();
+}

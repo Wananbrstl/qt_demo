@@ -1,0 +1,281 @@
+#include "workstation/DatabaseWorkbenchWindow.h"
+
+#include "workers/HistorianWorker.h"
+#include "workers/MysqlSyncWorker.h"
+
+#include <QCloseEvent>
+#include <QDateTime>
+#include <QDockWidget>
+#include <QFormLayout>
+#include <QHBoxLayout>
+#include <QHeaderView>
+#include <QLabel>
+#include <QLineEdit>
+#include <QPlainTextEdit>
+#include <QPushButton>
+#include <QSpinBox>
+#include <QStandardItemModel>
+#include <QStatusBar>
+#include <QTableView>
+#include <QTimer>
+#include <QUuid>
+#include <QVBoxLayout>
+
+#include <cmath>
+#include <utility>
+
+namespace ds::database {
+namespace {
+
+QStandardItem* numericItem(const double value, const int precision = 2) {
+    auto* item = new QStandardItem(QString::number(value, 'f', precision));
+    item->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    return item;
+}
+
+}  // namespace
+
+DatabaseWorkbenchWindow::DatabaseWorkbenchWindow(HistorianConfig config,
+                                                 QWidget* parent)
+    : QMainWindow(parent), config_(std::move(config)) {
+    buildUi();
+    startWorker();
+}
+
+DatabaseWorkbenchWindow::~DatabaseWorkbenchWindow() {
+    stopWorkers();
+}
+
+void DatabaseWorkbenchWindow::closeEvent(QCloseEvent* event) {
+    if (!shutdownStarted_) {
+        shutdownStarted_ = true;
+        generator_->stop();
+        setEnabled(false);
+        stopWorkers();
+    }
+    event->accept();
+}
+
+void DatabaseWorkbenchWindow::toggleGenerator() {
+    if (generator_->isActive()) {
+        generator_->stop();
+        generatorButton_->setText(tr("Start lab stream"));
+    } else {
+        generator_->start();
+        generatorButton_->setText(tr("Stop lab stream"));
+    }
+}
+
+void DatabaseWorkbenchWindow::generateSample() {
+    ++generatedCount_;
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    const double phase = static_cast<double>(generatedCount_) / 20.0;
+    emit telemetryGenerated({QUuid::createUuid().toRfc4122(),
+                             deviceEdit_->text().trimmed(),
+                             QStringLiteral("Database laboratory machine"),
+                             now, now,
+                             42.0 + std::sin(phase) * 4.0,
+                             2400.0 + std::sin(phase * 0.5) * 100.0,
+                             1.2 + std::abs(std::sin(phase * 1.7)),
+                             60.0 + std::sin(phase * 0.7) * 20.0,
+                             0});
+}
+
+void DatabaseWorkbenchWindow::requestHistory() {
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    emit historyRequested({deviceEdit_->text().trimmed(),
+                           now - static_cast<qint64>(minutesSpin_->value()) * 60000,
+                           now, 1000, {}});
+}
+
+void DatabaseWorkbenchWindow::showHistory(HistoryQuery,
+                                          HistoryPage page,
+                                          DbError error) {
+    if (error.isError()) {
+        appendLog(QStringLiteral("query"), error.diagnosticText());
+        return;
+    }
+    model_->removeRows(0, model_->rowCount());
+    for (const TelemetryRecord& record : page.records) {
+        QList<QStandardItem*> row;
+        row << new QStandardItem(QDateTime::fromMSecsSinceEpoch(record.capturedAtMs)
+                                     .toString(QStringLiteral("yyyy-MM-dd HH:mm:ss.zzz")))
+            << new QStandardItem(record.deviceId)
+            << numericItem(record.temperatureC)
+            << numericItem(record.spindleRpm, 0)
+            << numericItem(record.vibrationMmPerSecond)
+            << numericItem(record.loadPercent)
+            << new QStandardItem(QString::number(record.quality));
+        model_->appendRow(row);
+    }
+    statusBar()->showMessage(tr("Loaded %1 rows").arg(page.records.size()), 5000);
+}
+
+void DatabaseWorkbenchWindow::showMetrics(const HistorianMetrics metrics) {
+    metricsValue_->setText(QStringLiteral(
+        "accepted=%1 persisted=%2 rejected=%3 memory=%4 outbox=%5 "
+        "synced=%6 mysql=%7 flush=%8ms sync=%9ms failures=%10/%11")
+        .arg(metrics.acceptedSamples).arg(metrics.persistedSamples)
+        .arg(metrics.rejectedSamples).arg(metrics.pendingMemorySamples)
+        .arg(metrics.pendingOutboxEvents).arg(metrics.synchronizedSamples)
+        .arg(metrics.mysqlOnline ? QStringLiteral("online") : QStringLiteral("offline"))
+        .arg(metrics.lastFlushMs).arg(metrics.lastSyncMs)
+        .arg(metrics.storageFailures).arg(metrics.synchronizationFailures));
+}
+
+void DatabaseWorkbenchWindow::appendLog(QString category, QString message) {
+    log_->appendPlainText(QStringLiteral("[%1] %2").arg(category, message));
+    log_->document()->setMaximumBlockCount(2000);
+}
+
+void DatabaseWorkbenchWindow::buildUi() {
+    setWindowTitle(tr("Qt 5 Industrial Database Workbench"));
+    resize(1200, 760);
+    model_ = new QStandardItemModel(this);
+    model_->setHorizontalHeaderLabels({tr("Captured"), tr("Device"),
+        tr("Temperature °C"), tr("RPM"), tr("Vibration mm/s"),
+        tr("Load %"), tr("Quality")});
+    table_ = new QTableView(this);
+    table_->setModel(model_);
+    table_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    table_->setAlternatingRowColors(true);
+    table_->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+    setCentralWidget(table_);
+
+    auto* controlDock = new QDockWidget(tr("Database laboratory"), this);
+    controlDock->setObjectName(QStringLiteral("DatabaseLabControlDock"));
+    auto* page = new QWidget(controlDock);
+    auto* layout = new QVBoxLayout(page);
+    auto* form = new QFormLayout;
+    statusValue_ = new QLabel(tr("Starting"), page);
+    deviceEdit_ = new QLineEdit(QStringLiteral("lab-machine-01"), page);
+    minutesSpin_ = new QSpinBox(page);
+    minutesSpin_->setRange(1, 7 * 24 * 60);
+    minutesSpin_->setValue(60);
+    form->addRow(tr("State"), statusValue_);
+    form->addRow(tr("Device ID"), deviceEdit_);
+    form->addRow(tr("History minutes"), minutesSpin_);
+    layout->addLayout(form);
+    generatorButton_ = new QPushButton(tr("Start lab stream"), page);
+    queryButton_ = new QPushButton(tr("Query SQLite history"), page);
+    auto* flushButton = new QPushButton(tr("Flush now"), page);
+    auto* syncButton = new QPushButton(tr("Synchronize now"), page);
+    layout->addWidget(generatorButton_);
+    layout->addWidget(queryButton_);
+    layout->addWidget(flushButton);
+    layout->addWidget(syncButton);
+    layout->addStretch(1);
+    controlDock->setWidget(page);
+    addDockWidget(Qt::LeftDockWidgetArea, controlDock);
+
+    auto* metricsDock = new QDockWidget(tr("Historian metrics"), this);
+    metricsDock->setObjectName(QStringLiteral("DatabaseLabMetricsDock"));
+    metricsValue_ = new QLabel(tr("No metrics"), metricsDock);
+    metricsValue_->setWordWrap(true);
+    metricsDock->setWidget(metricsValue_);
+    addDockWidget(Qt::BottomDockWidgetArea, metricsDock);
+    auto* logDock = new QDockWidget(tr("Database diagnostics"), this);
+    logDock->setObjectName(QStringLiteral("DatabaseLabLogDock"));
+    log_ = new QPlainTextEdit(logDock);
+    log_->setReadOnly(true);
+    logDock->setWidget(log_);
+    addDockWidget(Qt::BottomDockWidgetArea, logDock);
+    tabifyDockWidget(metricsDock, logDock);
+    logDock->raise();
+
+    generator_ = new QTimer(this);
+    generator_->setInterval(100);
+    connect(generator_, &QTimer::timeout,
+            this, &DatabaseWorkbenchWindow::generateSample);
+    connect(generatorButton_, &QPushButton::clicked,
+            this, &DatabaseWorkbenchWindow::toggleGenerator);
+    connect(queryButton_, &QPushButton::clicked,
+            this, &DatabaseWorkbenchWindow::requestHistory);
+    connect(flushButton, &QPushButton::clicked, this, &DatabaseWorkbenchWindow::flushRequested);
+    connect(syncButton, &QPushButton::clicked, this, &DatabaseWorkbenchWindow::syncRequested);
+}
+
+void DatabaseWorkbenchWindow::startWorker() {
+    worker_ = new HistorianWorker;
+    worker_->moveToThread(&databaseThread_);
+    databaseThread_.setObjectName(QStringLiteral("DatabaseLabHistorianThread"));
+    connect(&databaseThread_, &QThread::started, worker_,
+            [this] { worker_->initialize(config_); });
+    connect(this, &DatabaseWorkbenchWindow::telemetryGenerated,
+            worker_, &HistorianWorker::enqueueTelemetry, Qt::QueuedConnection);
+    connect(this, &DatabaseWorkbenchWindow::historyRequested,
+            worker_, &HistorianWorker::queryHistory, Qt::QueuedConnection);
+    connect(this, &DatabaseWorkbenchWindow::flushRequested,
+            worker_, &HistorianWorker::flushNow, Qt::QueuedConnection);
+    connect(this, &DatabaseWorkbenchWindow::syncRequested,
+            worker_, &HistorianWorker::synchronizeNow, Qt::QueuedConnection);
+    connect(worker_, &HistorianWorker::initialized, this,
+            [this](const bool success, const QString& message) {
+        statusValue_->setText(success ? tr("Ready") : tr("Failed"));
+        generatorButton_->setEnabled(success);
+        queryButton_->setEnabled(success);
+        appendLog(QStringLiteral("startup"), message);
+    });
+    connect(worker_, &HistorianWorker::historyReady,
+            this, &DatabaseWorkbenchWindow::showHistory);
+    connect(worker_, &HistorianWorker::metricsChanged,
+            this, &DatabaseWorkbenchWindow::showMetrics);
+    connect(worker_, &HistorianWorker::logMessage,
+            this, &DatabaseWorkbenchWindow::appendLog);
+    connect(worker_, &HistorianWorker::finished, worker_, &QObject::deleteLater);
+    connect(worker_, &HistorianWorker::finished, &databaseThread_, &QThread::quit);
+
+    if (config_.mysql.enabled) {
+        mysqlWorker_ = new MysqlSyncWorker;
+        mysqlWorker_->moveToThread(&mysqlThread_);
+        mysqlThread_.setObjectName(QStringLiteral("DatabaseLabMysqlThread"));
+        connect(&mysqlThread_, &QThread::started, mysqlWorker_,
+                [this] { mysqlWorker_->initialize(config_.mysql); });
+        connect(worker_, &HistorianWorker::outboxBatchReady,
+                mysqlWorker_, &MysqlSyncWorker::synchronize, Qt::QueuedConnection);
+        connect(mysqlWorker_, &MysqlSyncWorker::batchSucceeded,
+                worker_, &HistorianWorker::markSynchronized, Qt::QueuedConnection);
+        connect(mysqlWorker_, &MysqlSyncWorker::batchFailed,
+                worker_, &HistorianWorker::postponeSynchronization,
+                Qt::QueuedConnection);
+        connect(mysqlWorker_, &MysqlSyncWorker::payloadRejected,
+                worker_, &HistorianWorker::deadLetterPartial, Qt::QueuedConnection);
+        connect(mysqlWorker_, &MysqlSyncWorker::onlineChanged,
+                worker_, &HistorianWorker::setMysqlOnline, Qt::QueuedConnection);
+        connect(mysqlWorker_, &MysqlSyncWorker::initialized, this,
+                [this](bool, const QString& message) {
+            appendLog(QStringLiteral("mysql"), message);
+        });
+        connect(mysqlWorker_, &MysqlSyncWorker::logMessage,
+                this, &DatabaseWorkbenchWindow::appendLog);
+        connect(mysqlWorker_, &MysqlSyncWorker::finished,
+                mysqlWorker_, &QObject::deleteLater);
+        connect(mysqlWorker_, &MysqlSyncWorker::finished,
+                &mysqlThread_, &QThread::quit);
+        mysqlThread_.start();
+    }
+    generatorButton_->setEnabled(false);
+    queryButton_->setEnabled(false);
+    databaseThread_.start();
+}
+
+void DatabaseWorkbenchWindow::stopWorkers() {
+    // Stop the remote consumer first. Its final acknowledgement is queued to
+    // the still-running SQLite worker before that worker performs its flush.
+    if (mysqlWorker_ && mysqlThread_.isRunning()) {
+        QMetaObject::invokeMethod(mysqlWorker_, "shutdown",
+                                  Qt::BlockingQueuedConnection);
+        mysqlThread_.quit();
+        mysqlThread_.wait(5000);
+        mysqlWorker_ = nullptr;
+    }
+    if (worker_ && databaseThread_.isRunning()) {
+        QMetaObject::invokeMethod(worker_, "shutdown",
+                                  Qt::BlockingQueuedConnection);
+        databaseThread_.quit();
+        databaseThread_.wait(5000);
+        worker_ = nullptr;
+    }
+}
+
+}  // namespace ds::database

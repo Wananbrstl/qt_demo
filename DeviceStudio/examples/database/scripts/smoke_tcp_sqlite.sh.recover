@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_root=${1:-"$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"}
+build_root=${2:-"${project_root}/build/linux-debug"}
+database_config=${3:-"${project_root}/examples/database/config/database_lab.json"}
+port=${DEVICESTUDIO_SMOKE_PORT:-45457}
+work_directory=$(mktemp -d /tmp/devicestudio-database-smoke.XXXXXX)
+simulator_pid=
+
+stop_simulator() {
+    if [[ -n "${simulator_pid}" ]] && kill -0 "${simulator_pid}" 2>/dev/null; then
+        kill "${simulator_pid}" 2>/dev/null || true
+        wait "${simulator_pid}" 2>/dev/null || true
+    fi
+}
+trap stop_simulator EXIT
+
+cd "${work_directory}"
+"${build_root}/examples/tcp/TcpDeviceSimulator" \
+    --port "${port}" --telemetry-ms 50 \
+    >simulator.log 2>&1 &
+simulator_pid=$!
+
+collector_status=0
+timeout -s INT 5s "${build_root}/examples/database/HistorianCollector" \
+    --database-config "${database_config}" \
+    --host 127.0.0.1 --port "${port}" \
+    >collector.log 2>&1 || collector_status=$?
+
+if [[ "${collector_status}" -ne 0 && "${collector_status}" -ne 124 ]]; then
+    echo "collector failed with status ${collector_status}" >&2
+    tail -n 50 collector.log >&2
+    exit "${collector_status}"
+fi
+stop_simulator
+simulator_pid=
+trap - EXIT
+
+row_count=$(sqlite3 device-history.db "SELECT COUNT(*) FROM telemetry_samples;")
+outbox_count=$(sqlite3 device-history.db "SELECT COUNT(*) FROM outbox_events WHERE state='pending';")
+integrity=$(sqlite3 device-history.db "PRAGMA integrity_check;")
+if [[ "${row_count}" -le 0 || "${integrity}" != "ok" ]]; then
+    echo "smoke test failed: rows=${row_count}, integrity=${integrity}" >&2
+    exit 1
+fi
+
+echo "work_directory=${work_directory}"
+echo "persisted_rows=${row_count} pending_outbox=${outbox_count} integrity=${integrity}"
+tail -n 12 collector.log

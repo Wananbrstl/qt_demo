@@ -1,0 +1,42 @@
+#include "infrastructure/DatabaseSession.h"
+
+#include <QCoreApplication>
+#include <QDebug>
+#include <QLibraryInfo>
+#include <QSqlDatabase>
+
+using namespace ds::database;
+
+int main(int argc, char* argv[]) {
+    QCoreApplication application(argc, argv);
+    QCoreApplication::setApplicationName(QStringLiteral("DatabaseDriverProbe"));
+
+    qInfo().noquote() << QStringLiteral("Qt runtime: %1").arg(qVersion());
+    qInfo().noquote() << QStringLiteral("Qt plugin path: %1")
+                             .arg(QLibraryInfo::location(QLibraryInfo::PluginsPath));
+    qInfo() << "SQL drivers:" << QSqlDatabase::drivers();
+
+    if (!QSqlDatabase::isDriverAvailable(QStringLiteral("QSQLITE"))) {
+        qCritical() << "QSQLITE is unavailable; use QT_DEBUG_PLUGINS=1 for details";
+        return 2;
+    }
+    DatabaseSession sqlite(DatabaseBackend::SQLite, QStringLiteral("probe"));
+    SqliteConfig config;
+    config.path = QStringLiteral(":memory:");
+    config.enableWal = false;
+    const OperationResult opened = sqlite.open(config);
+    if (!opened.succeeded()) {
+        qCritical().noquote() << opened.error.diagnosticText();
+        return 3;
+    }
+    qInfo().noquote() << QStringLiteral("SQLite runtime: %1")
+                             .arg(sqlite.engineVersion());
+    sqlite.close();
+
+    if (QSqlDatabase::isDriverAvailable(QStringLiteral("QMYSQL"))) {
+        qInfo() << "QMYSQL plugin: available (connection not attempted)";
+    } else {
+        qWarning() << "QMYSQL plugin: unavailable";
+    }
+    return 0;
+}

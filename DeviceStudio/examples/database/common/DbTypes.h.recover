@@ -1,0 +1,167 @@
+#pragma once
+
+#include <QByteArray>
+#include <QMetaType>
+#include <QString>
+#include <QVector>
+
+#include <optional>
+#include <utility>
+
+namespace ds::database {
+
+enum class DatabaseBackend : quint8 { SQLite, MySQL };
+
+struct SqliteConfig final {
+    QString path{QStringLiteral("device-history.db")};
+    int busyTimeoutMs{3000};
+    int walAutoCheckpointPages{1000};
+    bool enableWal{true};
+    bool synchronousFull{false};
+};
+
+struct MysqlConfig final {
+    bool enabled{false};
+    QString host{QStringLiteral("127.0.0.1")};
+    quint16 port{3306};
+    QString database{QStringLiteral("device_history")};
+    QString user{QStringLiteral("device_app")};
+    QString passwordEnvironment{QStringLiteral("DEVICESTUDIO_MYSQL_PASSWORD")};
+    int connectTimeoutSeconds{5};
+    int readTimeoutSeconds{10};
+    int writeTimeoutSeconds{10};
+    QString sslCa;
+    QString sslCertificate;
+    QString sslKey;
+};
+
+struct HistorianConfig final {
+    SqliteConfig sqlite;
+    MysqlConfig mysql;
+    int flushIntervalMs{250};
+    int maximumBatchRows{500};
+    int maximumPendingSamples{10000};
+    int syncIntervalMs{1000};
+    int syncBatchRows{200};
+
+    [[nodiscard]] QString validate() const;
+};
+
+enum class DbErrorCategory : quint8 {
+    None,
+    Configuration,
+    DriverUnavailable,
+    Connection,
+    Constraint,
+    Busy,
+    Deadlock,
+    Timeout,
+    Storage,
+    Migration,
+    Query,
+    Data,
+    Unknown
+};
+
+struct DbError final {
+    DbErrorCategory category{DbErrorCategory::None};
+    QString operation;
+    QString driverText;
+    QString databaseText;
+    QString nativeCode;
+    bool retryable{};
+
+    [[nodiscard]] bool isError() const noexcept {
+        return category != DbErrorCategory::None;
+    }
+    [[nodiscard]] QString diagnosticText() const;
+};
+
+struct OperationResult final {
+    DbError error;
+    [[nodiscard]] bool succeeded() const noexcept { return !error.isError(); }
+    [[nodiscard]] static OperationResult success() { return {}; }
+    [[nodiscard]] static OperationResult failure(DbError value) {
+        return {std::move(value)};
+    }
+};
+
+template <typename T>
+struct ValueResult final {
+    std::optional<T> value;
+    DbError error;
+    [[nodiscard]] bool succeeded() const noexcept {
+        return value.has_value() && !error.isError();
+    }
+};
+
+struct TelemetryRecord final {
+    QByteArray eventId;        // RFC-4122 UUID bytes, exactly 16 bytes.
+    QString deviceId;
+    QString deviceName;
+    qint64 capturedAtMs{};
+    qint64 receivedAtMs{};
+    double temperatureC{};
+    double spindleRpm{};
+    double vibrationMmPerSecond{};
+    double loadPercent{};
+    int quality{};
+
+    [[nodiscard]] QString validate() const;
+};
+
+struct HistoryCursor final {
+    qint64 capturedAtMs{};
+    QByteArray eventId;
+};
+
+struct HistoryQuery final {
+    QString deviceId;
+    qint64 fromMs{};
+    qint64 toMs{};
+    int limit{500};
+    std::optional<HistoryCursor> before;
+};
+
+struct HistoryPage final {
+    QVector<TelemetryRecord> records;
+    std::optional<HistoryCursor> next;
+};
+
+struct OutboxEvent final {
+    QByteArray eventId;
+    QString eventType;
+    QByteArray payload;
+    qint64 createdAtMs{};
+    int attemptCount{};
+};
+
+using EventIdList = QVector<QByteArray>;
+
+struct HistorianMetrics final {
+    quint64 acceptedSamples{};
+    quint64 persistedSamples{};
+    quint64 rejectedSamples{};
+    quint64 synchronizedSamples{};
+    quint64 storageFailures{};
+    quint64 synchronizationFailures{};
+    int pendingMemorySamples{};
+    int pendingOutboxEvents{};
+    qint64 lastFlushMs{-1};
+    qint64 lastSyncMs{-1};
+    bool mysqlOnline{};
+};
+
+void registerDatabaseMetaTypes();
+
+}  // namespace ds::database
+
+Q_DECLARE_METATYPE(ds::database::HistorianConfig)
+Q_DECLARE_METATYPE(ds::database::DbError)
+Q_DECLARE_METATYPE(ds::database::TelemetryRecord)
+Q_DECLARE_METATYPE(ds::database::HistoryQuery)
+Q_DECLARE_METATYPE(ds::database::HistoryPage)
+Q_DECLARE_METATYPE(ds::database::HistorianMetrics)
+Q_DECLARE_METATYPE(ds::database::OutboxEvent)
+Q_DECLARE_METATYPE(QVector<ds::database::OutboxEvent>)
+Q_DECLARE_METATYPE(ds::database::EventIdList)

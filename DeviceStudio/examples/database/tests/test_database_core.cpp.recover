@@ -1,0 +1,134 @@
+#include "common/DatabaseConfigLoader.h"
+#include "infrastructure/DatabaseSession.h"
+#include "infrastructure/MigrationRunner.h"
+#include "infrastructure/TransactionGuard.h"
+#include "repositories/HistorianRepository.h"
+#include "schema/HistorianSchema.h"
+
+#include <QDateTime>
+#include <QSqlQuery>
+#include <QTemporaryDir>
+#include <QTest>
+#include <QUuid>
+
+using namespace ds::database;
+
+namespace {
+
+TelemetryRecord sample(const QString& device, const qint64 capturedAt,
+                       const double temperature) {
+    return {QUuid::createUuid().toRfc4122(), device, QStringLiteral("Lab device"),
+            capturedAt, QDateTime::currentMSecsSinceEpoch(), temperature,
+            2400.0, 1.2, 60.0, 0};
+}
+
+}  // namespace
+
+class DatabaseCoreTest final : public QObject {
+    Q_OBJECT
+
+private slots:
+    void configurationBoundary();
+    void migrationIsIdempotentAndImmutable();
+    void transactionRollsBackOnScopeExit();
+    void repositoryPersistsPagesAndOutboxIdempotently();
+};
+
+void DatabaseCoreTest::configurationBoundary() {
+    const auto loaded = DatabaseConfigLoader::fromJson(R"json({
+      "sqlite": {"path": "lab.db", "busyTimeoutMs": 500},
+      "mysql": {"enabled": false},
+      "batching": {"maximumBatchRows": 100, "maximumPendingSamples": 200}
+    })json");
+    QVERIFY2(loaded.succeeded(), qPrintable(loaded.error));
+    QCOMPARE(loaded.config.sqlite.path, QStringLiteral("lab.db"));
+    QCOMPARE(loaded.config.maximumBatchRows, 100);
+
+    const auto invalid = DatabaseConfigLoader::fromJson(R"json({
+      "sqlite": {"path": ""}, "mysql": {"port": 70000}
+    })json");
+    QVERIFY(!invalid.succeeded());
+}
+
+void DatabaseCoreTest::migrationIsIdempotentAndImmutable() {
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    DatabaseSession session(DatabaseBackend::SQLite, QStringLiteral("migration-test"));
+    SqliteConfig config;
+    config.path = directory.filePath(QStringLiteral("migration.db"));
+    QVERIFY(session.open(config).succeeded());
+    const QVector<Migration> migrations = HistorianSchema::sqliteMigrations();
+    QVERIFY(MigrationRunner::apply(session, migrations).succeeded());
+    QVERIFY(MigrationRunner::apply(session, migrations).succeeded());
+
+    QVector<Migration> modified = migrations;
+    modified[0].statements.push_back(QStringLiteral("CREATE TABLE forbidden_change(id INT)"));
+    const OperationResult rejected = MigrationRunner::apply(session, modified);
+    QVERIFY(!rejected.succeeded());
+    QCOMPARE(static_cast<int>(rejected.error.category),
+             static_cast<int>(DbErrorCategory::Migration));
+    session.close();
+}
+
+void DatabaseCoreTest::transactionRollsBackOnScopeExit() {
+    DatabaseSession session(DatabaseBackend::SQLite, QStringLiteral("rollback-test"));
+    SqliteConfig config;
+    config.path = QStringLiteral(":memory:");
+    config.enableWal = false;
+    QVERIFY(session.open(config).succeeded());
+    QVERIFY(MigrationRunner::apply(session, HistorianSchema::sqliteMigrations()).succeeded());
+    {
+        TransactionGuard transaction(session, QStringLiteral("rollback exercise"));
+        QVERIFY(transaction.began());
+        QSqlQuery query(session.database());
+        QVERIFY(query.exec(QStringLiteral(
+            "INSERT INTO devices VALUES('transient','Transient',1,1)")));
+    }
+    QSqlQuery count(session.database());
+    QVERIFY(count.exec(QStringLiteral("SELECT COUNT(*) FROM devices")));
+    QVERIFY(count.next());
+    QCOMPARE(count.value(0).toInt(), 0);
+    session.close();
+}
+
+void DatabaseCoreTest::repositoryPersistsPagesAndOutboxIdempotently() {
+    DatabaseSession session(DatabaseBackend::SQLite, QStringLiteral("repository-test"));
+    SqliteConfig config;
+    config.path = QStringLiteral(":memory:");
+    config.enableWal = false;
+    QVERIFY(session.open(config).succeeded());
+    QVERIFY(MigrationRunner::apply(session, HistorianSchema::sqliteMigrations()).succeeded());
+    HistorianRepository repository(session);
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    QVector<TelemetryRecord> records{
+        sample(QStringLiteral("machine-01"), now - 3, 41.0),
+        sample(QStringLiteral("machine-01"), now - 2, 42.0),
+        sample(QStringLiteral("machine-01"), now - 1, 43.0)};
+    QVERIFY(repository.persistLocalBatch(records, true).succeeded());
+    QVERIFY(repository.persistLocalBatch(records, true).succeeded());
+
+    HistoryQuery first{QStringLiteral("machine-01"), now - 100, now, 2, {}};
+    const auto firstPage = repository.queryHistory(first);
+    QVERIFY(firstPage.succeeded());
+    QCOMPARE(firstPage.value->records.size(), 2);
+    QVERIFY(firstPage.value->next.has_value());
+    QCOMPARE(firstPage.value->records.front().temperatureC, 43.0);
+
+    first.before = firstPage.value->next;
+    const auto secondPage = repository.queryHistory(first);
+    QVERIFY(secondPage.succeeded());
+    QCOMPARE(secondPage.value->records.size(), 1);
+    QCOMPARE(secondPage.value->records.front().temperatureC, 41.0);
+
+    const auto outbox = repository.pendingOutbox(100, now + 1);
+    QVERIFY(outbox.succeeded());
+    QCOMPARE(outbox.value->size(), 3);
+    const auto decoded = HistorianRepository::decodeTelemetry(
+        outbox.value->front().payload);
+    QVERIFY(decoded.succeeded());
+    QCOMPARE(decoded.value->deviceId, QStringLiteral("machine-01"));
+    session.close();
+}
+
+QTEST_APPLESS_MAIN(DatabaseCoreTest)
+#include "test_database_core.moc"

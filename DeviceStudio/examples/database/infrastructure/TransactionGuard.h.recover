@@ -1,0 +1,33 @@
+#pragma once
+
+#include "common/DbTypes.h"
+
+#include <QSqlDatabase>
+
+namespace ds::database {
+
+class DatabaseSession;
+
+class TransactionGuard final {
+public:
+    TransactionGuard(DatabaseSession& session, QString operation);
+    ~TransactionGuard();
+
+    TransactionGuard(const TransactionGuard&) = delete;
+    TransactionGuard& operator=(const TransactionGuard&) = delete;
+
+    [[nodiscard]] bool began() const noexcept { return began_; }
+    [[nodiscard]] const DbError& error() const noexcept { return error_; }
+    [[nodiscard]] OperationResult commit();
+    void rollback();
+
+private:
+    DatabaseSession& session_;
+    QSqlDatabase database_;
+    QString operation_;
+    DbError error_;
+    bool began_{};
+    bool completed_{};
+};
+
+}  // namespace ds::database

@@ -6,4 +6,4 @@
 *.db
 *.db-shm
 *.db-wal
-
+/examples/database/docker/secrets/mysql_app_password

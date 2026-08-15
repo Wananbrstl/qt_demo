@@ -1,0 +1,57 @@
+#include "schema/HistorianSchema.h"
+
+namespace ds::database {
+
+QVector<Migration> HistorianSchema::sqliteMigrations() {
+    return {{1, QStringLiteral("historian core and transactional outbox"), {
+        QStringLiteral(
+            "CREATE TABLE devices("
+            "device_id TEXT PRIMARY KEY NOT NULL, display_name TEXT NOT NULL, "
+            "created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL)"),
+        QStringLiteral(
+            "CREATE TABLE telemetry_samples("
+            "event_id BLOB PRIMARY KEY NOT NULL CHECK(length(event_id)=16), "
+            "device_id TEXT NOT NULL REFERENCES devices(device_id), "
+            "captured_at_ms INTEGER NOT NULL, received_at_ms INTEGER NOT NULL, "
+            "temperature_c REAL NOT NULL, spindle_rpm REAL NOT NULL, "
+            "vibration_mm_s REAL NOT NULL, load_percent REAL NOT NULL, "
+            "quality INTEGER NOT NULL CHECK(quality BETWEEN 0 AND 255))"),
+        QStringLiteral(
+            "CREATE INDEX telemetry_device_time_idx ON telemetry_samples("
+            "device_id, captured_at_ms DESC, event_id DESC)"),
+        QStringLiteral(
+            "CREATE TABLE outbox_events("
+            "event_id BLOB PRIMARY KEY NOT NULL CHECK(length(event_id)=16), "
+            "event_type TEXT NOT NULL, payload BLOB NOT NULL, "
+            "created_at_ms INTEGER NOT NULL, attempt_count INTEGER NOT NULL DEFAULT 0, "
+            "next_attempt_at_ms INTEGER NOT NULL DEFAULT 0, "
+            "last_error TEXT NOT NULL DEFAULT '', "
+            "state TEXT NOT NULL DEFAULT 'pending' "
+            "CHECK(state IN ('pending','synced','dead')))"),
+        QStringLiteral(
+            "CREATE INDEX outbox_pending_idx ON outbox_events("
+            "state, next_attempt_at_ms, created_at_ms, event_id)"),
+    }}};
+}
+
+QVector<Migration> HistorianSchema::mysqlMigrations() {
+    return {{1, QStringLiteral("central historian core"), {
+        QStringLiteral(
+            "CREATE TABLE IF NOT EXISTS devices("
+            "device_id VARCHAR(128) PRIMARY KEY, display_name VARCHAR(255) NOT NULL, "
+            "created_at_ms BIGINT NOT NULL, updated_at_ms BIGINT NOT NULL) "
+            "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"),
+        QStringLiteral(
+            "CREATE TABLE IF NOT EXISTS telemetry_samples("
+            "event_id BINARY(16) PRIMARY KEY, device_id VARCHAR(128) NOT NULL, "
+            "captured_at_ms BIGINT NOT NULL, received_at_ms BIGINT NOT NULL, "
+            "temperature_c DOUBLE NOT NULL, spindle_rpm DOUBLE NOT NULL, "
+            "vibration_mm_s DOUBLE NOT NULL, load_percent DOUBLE NOT NULL, "
+            "quality TINYINT UNSIGNED NOT NULL, "
+            "CONSTRAINT telemetry_device_fk FOREIGN KEY(device_id) REFERENCES devices(device_id), "
+            "INDEX telemetry_device_time_idx(device_id, captured_at_ms DESC, event_id DESC)) "
+            "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"),
+    }}};
+}
+
+}  // namespace ds::database

@@ -77,3 +77,9 @@ option(DEVICESTUDIO_BUILD_TCP_LABS
 if(DEVICESTUDIO_BUILD_TCP_LABS)
     add_subdirectory(examples/tcp)
 endif()
+
+option(DEVICESTUDIO_BUILD_DATABASE_LABS
+       "Build the production-style database learning laboratory" ON)
+if(DEVICESTUDIO_BUILD_DATABASE_LABS)
+    add_subdirectory(examples/database)
+endif()

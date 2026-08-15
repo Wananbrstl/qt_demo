@@ -1,0 +1,51 @@
+#include "infrastructure/DatabaseSession.h"
+#include "infrastructure/MigrationRunner.h"
+#include "schema/HistorianSchema.h"
+
+#include <QSqlError>
+#include <QSqlQuery>
+#include <QTemporaryDir>
+#include <QTest>
+
+using namespace ds::database;
+
+class SqliteConcurrencyTest final : public QObject {
+    Q_OBJECT
+
+private slots:
+    void secondWriterReceivesBoundedBusyFailure();
+};
+
+void SqliteConcurrencyTest::secondWriterReceivesBoundedBusyFailure() {
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    SqliteConfig config;
+    config.path = directory.filePath(QStringLiteral("locking.db"));
+    config.busyTimeoutMs = 50;
+    DatabaseSession first(DatabaseBackend::SQLite, QStringLiteral("writer-one"));
+    DatabaseSession second(DatabaseBackend::SQLite, QStringLiteral("writer-two"));
+    QVERIFY(first.open(config).succeeded());
+    QVERIFY(MigrationRunner::apply(first, HistorianSchema::sqliteMigrations()).succeeded());
+    QVERIFY(second.open(config).succeeded());
+
+    QSqlQuery lock(first.database());
+    QVERIFY(lock.exec(QStringLiteral("BEGIN IMMEDIATE")));
+    QVERIFY(lock.exec(QStringLiteral(
+        "INSERT INTO devices VALUES('one','one',1,1)")));
+
+    QSqlQuery blocked(second.database());
+    QVERIFY(!blocked.exec(QStringLiteral(
+        "INSERT INTO devices VALUES('two','two',1,1)")));
+    const DbError classified = second.errorFrom(
+        blocked.lastError(), QStringLiteral("competing SQLite writer"));
+    QCOMPARE(static_cast<int>(classified.category),
+             static_cast<int>(DbErrorCategory::Busy));
+    QVERIFY(classified.retryable);
+
+    QVERIFY(lock.exec(QStringLiteral("ROLLBACK")));
+    first.close();
+    second.close();
+}
+
+QTEST_APPLESS_MAIN(SqliteConcurrencyTest)
+#include "test_sqlite_concurrency.moc"

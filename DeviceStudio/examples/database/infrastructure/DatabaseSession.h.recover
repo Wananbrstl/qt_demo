@@ -1,0 +1,50 @@
+#pragma once
+
+#include "common/DbTypes.h"
+
+#include <QSqlDatabase>
+#include <QString>
+
+class QSqlError;
+class QThread;
+
+namespace ds::database {
+
+// Owns one named Qt SQL connection. It must be opened, used, and closed in the
+// same thread. close() destroys the value handle before removeDatabase().
+class DatabaseSession final {
+public:
+    DatabaseSession(DatabaseBackend backend, QString role);
+    ~DatabaseSession();
+
+    DatabaseSession(const DatabaseSession&) = delete;
+    DatabaseSession& operator=(const DatabaseSession&) = delete;
+
+    [[nodiscard]] OperationResult open(const SqliteConfig& config);
+    [[nodiscard]] OperationResult open(const MysqlConfig& config);
+    void close();
+
+    [[nodiscard]] bool isOpen() const;
+    [[nodiscard]] DatabaseBackend backend() const noexcept { return backend_; }
+    [[nodiscard]] QString connectionName() const { return connectionName_; }
+    [[nodiscard]] QSqlDatabase database() const;
+    [[nodiscard]] QString engineVersion() const;
+
+    [[nodiscard]] DbError errorFrom(const QSqlError& error,
+                                    QString operation) const;
+    [[nodiscard]] DbError configurationError(QString operation,
+                                             QString detail) const;
+
+private:
+    [[nodiscard]] OperationResult executeRequired(QString statement,
+                                                  QString operation);
+    [[nodiscard]] bool isOwnerThread() const noexcept;
+
+    DatabaseBackend backend_;
+    QString role_;
+    QString connectionName_;
+    QSqlDatabase database_;
+    QThread* ownerThread_{};
+};
+
+}  // namespace ds::database

@@ -1,0 +1,182 @@
+#include "common/DatabaseConfigLoader.h"
+#include "common/DbTypes.h"
+#include "common/TcpTypes.h"
+#include "session/DeviceSession.h"
+#include "workers/HistorianWorker.h"
+#include "workers/MysqlSyncWorker.h"
+
+#include <QCommandLineParser>
+#include <QCoreApplication>
+#include <QDateTime>
+#include <QDebug>
+#include <QThread>
+#include <QTimer>
+#include <QUuid>
+
+#include <atomic>
+#include <csignal>
+
+namespace {
+
+std::atomic_bool stopRequested{false};
+
+extern "C" void requestStop(int) {
+    stopRequested.store(true, std::memory_order_relaxed);
+}
+
+}  // namespace
+
+int main(int argc, char* argv[]) {
+    QCoreApplication application(argc, argv);
+    QCoreApplication::setApplicationName(QStringLiteral("HistorianCollector"));
+    ds::database::registerDatabaseMetaTypes();
+    ds::tcp::registerTcpMetaTypes();
+
+    QCommandLineParser parser;
+    parser.setApplicationDescription(
+        QStringLiteral("TCP to SQLite/MySQL industrial historian collector"));
+    parser.addHelpOption();
+    parser.addOption({QStringLiteral("database-config"),
+                      QStringLiteral("database JSON config"), QStringLiteral("path"),
+                      QStringLiteral("examples/database/config/database_lab.json")});
+    parser.addOption({QStringLiteral("host"), QStringLiteral("device host"),
+                      QStringLiteral("host"), QStringLiteral("127.0.0.1")});
+    parser.addOption({QStringLiteral("port"), QStringLiteral("device port"),
+                      QStringLiteral("port"), QStringLiteral("45455")});
+    parser.process(application);
+
+    const auto loaded = ds::database::DatabaseConfigLoader::fromFile(
+        parser.value(QStringLiteral("database-config")));
+    if (!loaded.succeeded()) {
+        qCritical().noquote() << loaded.error;
+        return 2;
+    }
+    bool portOk = false;
+    const int port = parser.value(QStringLiteral("port")).toInt(&portOk);
+    if (!portOk || port < 1 || port > 65535) parser.showHelp(2);
+
+    QThread databaseThread;
+    databaseThread.setObjectName(QStringLiteral("HistorianCollectorDatabaseThread"));
+    auto* historian = new ds::database::HistorianWorker;
+    historian->moveToThread(&databaseThread);
+    QObject::connect(&databaseThread, &QThread::started, historian,
+                     [historian, config = loaded.config] {
+        historian->initialize(config);
+    });
+    QObject::connect(historian, &ds::database::HistorianWorker::logMessage,
+                     [](const QString& category, const QString& message) {
+        qInfo().noquote() << QStringLiteral("[%1] %2").arg(category, message);
+    });
+    QObject::connect(historian, &ds::database::HistorianWorker::finished,
+                     historian, &QObject::deleteLater);
+    QObject::connect(historian, &ds::database::HistorianWorker::finished,
+                     &databaseThread, &QThread::quit);
+
+    QThread mysqlThread;
+    mysqlThread.setObjectName(QStringLiteral("HistorianCollectorMysqlThread"));
+    ds::database::MysqlSyncWorker* mysqlWorker = nullptr;
+    if (loaded.config.mysql.enabled) {
+        mysqlWorker = new ds::database::MysqlSyncWorker;
+        mysqlWorker->moveToThread(&mysqlThread);
+        QObject::connect(&mysqlThread, &QThread::started, mysqlWorker,
+                         [mysqlWorker, config = loaded.config.mysql] {
+            mysqlWorker->initialize(config);
+        });
+        QObject::connect(historian,
+                         &ds::database::HistorianWorker::outboxBatchReady,
+                         mysqlWorker,
+                         &ds::database::MysqlSyncWorker::synchronize,
+                         Qt::QueuedConnection);
+        QObject::connect(mysqlWorker,
+                         &ds::database::MysqlSyncWorker::batchSucceeded,
+                         historian,
+                         &ds::database::HistorianWorker::markSynchronized,
+                         Qt::QueuedConnection);
+        QObject::connect(mysqlWorker,
+                         &ds::database::MysqlSyncWorker::batchFailed,
+                         historian,
+                         &ds::database::HistorianWorker::postponeSynchronization,
+                         Qt::QueuedConnection);
+        QObject::connect(mysqlWorker,
+                         &ds::database::MysqlSyncWorker::payloadRejected,
+                         historian,
+                         &ds::database::HistorianWorker::deadLetterPartial,
+                         Qt::QueuedConnection);
+        QObject::connect(mysqlWorker,
+                         &ds::database::MysqlSyncWorker::onlineChanged,
+                         historian,
+                         &ds::database::HistorianWorker::setMysqlOnline,
+                         Qt::QueuedConnection);
+        QObject::connect(mysqlWorker, &ds::database::MysqlSyncWorker::logMessage,
+                         [](const QString& category, const QString& message) {
+            qInfo().noquote() << QStringLiteral("[%1] %2").arg(category, message);
+        });
+        QObject::connect(mysqlWorker, &ds::database::MysqlSyncWorker::initialized,
+                         [](bool, const QString& message) {
+            qInfo().noquote() << QStringLiteral("[mysql] %1").arg(message);
+        });
+        QObject::connect(mysqlWorker, &ds::database::MysqlSyncWorker::finished,
+                         mysqlWorker, &QObject::deleteLater);
+        QObject::connect(mysqlWorker, &ds::database::MysqlSyncWorker::finished,
+                         &mysqlThread, &QThread::quit);
+        mysqlThread.start();
+    }
+
+    ds::tcp::SessionConfig tcpConfig;
+    tcpConfig.endpoint.host = parser.value(QStringLiteral("host"));
+    tcpConfig.endpoint.port = static_cast<quint16>(port);
+    ds::tcp::DeviceSession device(tcpConfig);
+    QObject::connect(&device, &ds::tcp::DeviceSession::telemetryReceived,
+                     historian,
+                     [historian](const ds::tcp::TelemetrySample& sample) {
+        historian->enqueueTelemetry({QUuid::createUuid().toRfc4122(),
+                                     sample.deviceId, sample.deviceId,
+                                     sample.capturedAtMs,
+                                     QDateTime::currentMSecsSinceEpoch(),
+                                     sample.temperatureC, sample.spindleRpm,
+                                     sample.vibrationMmPerSecond,
+                                     sample.loadPercent, 0});
+    }, Qt::QueuedConnection);
+    QObject::connect(historian, &ds::database::HistorianWorker::initialized,
+                     &application, [&device](const bool success, const QString& message) {
+        if (!success) {
+            qCritical().noquote() << message;
+            QCoreApplication::exit(3);
+            return;
+        }
+        device.initialize();
+        device.connectDevice();
+    });
+    QObject::connect(&device, &ds::tcp::DeviceSession::stateChanged,
+                     [](const ds::tcp::SessionState state, const QString& reason) {
+        qInfo().noquote() << QStringLiteral("[tcp] %1: %2")
+                                .arg(ds::tcp::toString(state), reason);
+    });
+
+    databaseThread.start();
+    std::signal(SIGINT, requestStop);
+    std::signal(SIGTERM, requestStop);
+    QTimer stopPoll;
+    stopPoll.setInterval(100);
+    QObject::connect(&stopPoll, &QTimer::timeout, &application, [&application] {
+        if (stopRequested.load(std::memory_order_relaxed)) application.quit();
+    });
+    stopPoll.start();
+    QObject::connect(&application, &QCoreApplication::aboutToQuit,
+                     [&device, historian, mysqlWorker, &mysqlThread, &databaseThread] {
+        device.shutdown();
+        if (mysqlWorker && mysqlThread.isRunning()) {
+            QMetaObject::invokeMethod(mysqlWorker, "shutdown",
+                                      Qt::BlockingQueuedConnection);
+            mysqlThread.quit();
+            mysqlThread.wait(5000);
+        }
+        if (databaseThread.isRunning()) {
+            QMetaObject::invokeMethod(historian, "shutdown",
+                                      Qt::BlockingQueuedConnection);
+            databaseThread.quit();
+            databaseThread.wait(5000);
+        }
+    });
+    return application.exec();
+}

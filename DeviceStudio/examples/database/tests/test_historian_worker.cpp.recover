@@ -1,0 +1,57 @@
+#include "workers/HistorianWorker.h"
+
+#include "infrastructure/DatabaseSession.h"
+#include "infrastructure/MigrationRunner.h"
+#include "repositories/HistorianRepository.h"
+#include "schema/HistorianSchema.h"
+
+#include <QDateTime>
+#include <QSignalSpy>
+#include <QTemporaryDir>
+#include <QTest>
+#include <QUuid>
+
+using namespace ds::database;
+
+class HistorianWorkerTest final : public QObject {
+    Q_OBJECT
+
+private slots:
+    void boundedWorkerPersistsAndQueries();
+};
+
+void HistorianWorkerTest::boundedWorkerPersistsAndQueries() {
+    registerDatabaseMetaTypes();
+    qRegisterMetaType<DbError>();
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    HistorianConfig config;
+    config.sqlite.path = directory.filePath(QStringLiteral("worker.db"));
+    config.mysql.enabled = false;
+    config.maximumBatchRows = 2;
+    config.maximumPendingSamples = 4;
+
+    HistorianWorker worker;
+    QSignalSpy initialized(&worker, &HistorianWorker::initialized);
+    QSignalSpy history(&worker, &HistorianWorker::historyReady);
+    worker.initialize(config);
+    QCOMPARE(initialized.size(), 1);
+    QVERIFY(initialized.front().at(0).toBool());
+
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    worker.enqueueTelemetry({QUuid::createUuid().toRfc4122(),
+                             QStringLiteral("worker-device"), QStringLiteral("Worker"),
+                             now, now, 40.0, 1000.0, 1.0, 50.0, 0});
+    worker.enqueueTelemetry({QUuid::createUuid().toRfc4122(),
+                             QStringLiteral("worker-device"), QStringLiteral("Worker"),
+                             now + 1, now + 1, 41.0, 1001.0, 1.1, 51.0, 0});
+    worker.flushNow();
+    worker.queryHistory({QStringLiteral("worker-device"), now - 1, now + 2, 10, {}});
+    QCOMPARE(history.size(), 1);
+    const HistoryPage page = qvariant_cast<HistoryPage>(history.front().at(1));
+    QCOMPARE(page.records.size(), 2);
+    worker.shutdown();
+}
+
+QTEST_GUILESS_MAIN(HistorianWorkerTest)
+#include "test_historian_worker.moc"

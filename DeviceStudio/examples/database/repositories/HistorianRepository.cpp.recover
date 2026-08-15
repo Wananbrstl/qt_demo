@@ -1,0 +1,376 @@
+#include "repositories/HistorianRepository.h"
+
+#include "infrastructure/DatabaseSession.h"
+#include "infrastructure/TransactionGuard.h"
+
+#include <QCborMap>
+#include <QCborParserError>
+#include <QCborValue>
+#include <QSqlError>
+#include <QSqlQuery>
+
+#include <algorithm>
+#include <utility>
+
+namespace ds::database {
+namespace {
+
+DbError dataError(QString operation, QString detail) {
+    return {DbErrorCategory::Data, std::move(operation), std::move(detail),
+            {}, {}, false};
+}
+
+}  // namespace
+
+HistorianRepository::HistorianRepository(DatabaseSession& session)
+    : session_(session), database_(session.database()) {}
+
+OperationResult HistorianRepository::persistLocalBatch(
+    const QVector<TelemetryRecord>& records,
+    const bool stageForSynchronization) {
+    if (session_.backend() != DatabaseBackend::SQLite) {
+        return OperationResult::failure(session_.configurationError(
+            QStringLiteral("persist local batch"), QStringLiteral("requires SQLite")));
+    }
+    if (records.isEmpty()) return OperationResult::success();
+    TransactionGuard transaction(session_, QStringLiteral("persist local telemetry batch"));
+    if (!transaction.began()) return OperationResult::failure(transaction.error());
+    for (const TelemetryRecord& record : records) {
+        const QString validation = record.validate();
+        if (!validation.isEmpty()) {
+            transaction.rollback();
+            return OperationResult::failure(dataError(
+                QStringLiteral("validate telemetry"), validation));
+        }
+        OperationResult result = upsertDevice(record);
+        if (!result.succeeded()) {
+            transaction.rollback();
+            return result;
+        }
+        result = insertTelemetry(record);
+        if (!result.succeeded()) {
+            transaction.rollback();
+            return result;
+        }
+        if (stageForSynchronization) {
+            result = insertOutbox(record);
+            if (!result.succeeded()) {
+                transaction.rollback();
+                return result;
+            }
+        }
+    }
+    return transaction.commit();
+}
+
+OperationResult HistorianRepository::persistCentralBatch(
+    const QVector<TelemetryRecord>& records) {
+    if (session_.backend() != DatabaseBackend::MySQL) {
+        return OperationResult::failure(session_.configurationError(
+            QStringLiteral("persist central batch"), QStringLiteral("requires MySQL")));
+    }
+    if (records.isEmpty()) return OperationResult::success();
+    TransactionGuard transaction(session_, QStringLiteral("persist central telemetry batch"));
+    if (!transaction.began()) return OperationResult::failure(transaction.error());
+    for (const TelemetryRecord& record : records) {
+        const QString validation = record.validate();
+        if (!validation.isEmpty()) {
+            transaction.rollback();
+            return OperationResult::failure(dataError(
+                QStringLiteral("validate central telemetry"), validation));
+        }
+        OperationResult result = upsertDevice(record);
+        if (result.succeeded()) result = insertTelemetry(record);
+        if (!result.succeeded()) {
+            transaction.rollback();
+            return result;
+        }
+    }
+    return transaction.commit();
+}
+
+ValueResult<HistoryPage> HistorianRepository::queryHistory(
+    const HistoryQuery& query) const {
+    if (query.deviceId.trimmed().isEmpty() || query.fromMs > query.toMs
+        || query.limit < 1 || query.limit > 5000) {
+        return {{}, dataError(QStringLiteral("query history"),
+                              QStringLiteral("invalid history query"))};
+    }
+    QString sql = QStringLiteral(
+        "SELECT event_id, device_id, captured_at_ms, received_at_ms, "
+        "temperature_c, spindle_rpm, vibration_mm_s, load_percent, quality "
+        "FROM telemetry_samples WHERE device_id=? "
+        "AND captured_at_ms BETWEEN ? AND ? ");
+    if (query.before) {
+        sql += QStringLiteral(
+            "AND (captured_at_ms < ? OR (captured_at_ms = ? AND event_id < ?)) ");
+    }
+    sql += QStringLiteral("ORDER BY captured_at_ms DESC, event_id DESC LIMIT ?");
+
+    QSqlQuery statement(database_);
+    statement.setForwardOnly(true);
+    if (!statement.prepare(sql)) {
+        return {{}, session_.errorFrom(statement.lastError(),
+                                       QStringLiteral("prepare history query"))};
+    }
+    statement.addBindValue(query.deviceId);
+    statement.addBindValue(query.fromMs);
+    statement.addBindValue(query.toMs);
+    if (query.before) {
+        statement.addBindValue(query.before->capturedAtMs);
+        statement.addBindValue(query.before->capturedAtMs);
+        statement.addBindValue(query.before->eventId);
+    }
+    statement.addBindValue(query.limit);
+    if (!statement.exec()) {
+        return {{}, session_.errorFrom(statement.lastError(),
+                                       QStringLiteral("execute history query"))};
+    }
+
+    HistoryPage page;
+    page.records.reserve(query.limit);
+    while (statement.next()) {
+        page.records.push_back({statement.value(0).toByteArray(),
+                                statement.value(1).toString(), {},
+                                statement.value(2).toLongLong(),
+                                statement.value(3).toLongLong(),
+                                statement.value(4).toDouble(),
+                                statement.value(5).toDouble(),
+                                statement.value(6).toDouble(),
+                                statement.value(7).toDouble(),
+                                statement.value(8).toInt()});
+    }
+    if (statement.lastError().isValid()) {
+        return {{}, session_.errorFrom(statement.lastError(),
+                                       QStringLiteral("navigate history query"))};
+    }
+    if (page.records.size() == query.limit) {
+        const TelemetryRecord& last = page.records.back();
+        page.next = HistoryCursor{last.capturedAtMs, last.eventId};
+    }
+    return {std::move(page), {}};
+}
+
+ValueResult<QVector<OutboxEvent>> HistorianRepository::pendingOutbox(
+    const int limit, const qint64 nowMs) const {
+    if (session_.backend() != DatabaseBackend::SQLite || limit < 1 || limit > 5000) {
+        return {{}, dataError(QStringLiteral("read outbox"),
+                              QStringLiteral("invalid outbox request"))};
+    }
+    QSqlQuery query(database_);
+    query.setForwardOnly(true);
+    query.prepare(QStringLiteral(
+        "SELECT event_id, event_type, payload, created_at_ms, attempt_count "
+        "FROM outbox_events WHERE state='pending' AND next_attempt_at_ms<=? "
+        "ORDER BY created_at_ms, event_id LIMIT ?"));
+    query.addBindValue(nowMs);
+    query.addBindValue(limit);
+    if (!query.exec()) {
+        return {{}, session_.errorFrom(query.lastError(), QStringLiteral("read outbox"))};
+    }
+    QVector<OutboxEvent> result;
+    result.reserve(limit);
+    while (query.next()) {
+        result.push_back({query.value(0).toByteArray(), query.value(1).toString(),
+                          query.value(2).toByteArray(), query.value(3).toLongLong(),
+                          query.value(4).toInt()});
+    }
+    if (query.lastError().isValid()) {
+        return {{}, session_.errorFrom(query.lastError(),
+                                       QStringLiteral("navigate outbox"))};
+    }
+    return {std::move(result), {}};
+}
+
+OperationResult HistorianRepository::markOutboxSynchronized(
+    const QVector<QByteArray>& eventIds) {
+    if (eventIds.isEmpty()) return OperationResult::success();
+    TransactionGuard transaction(session_, QStringLiteral("mark outbox synchronized"));
+    if (!transaction.began()) return OperationResult::failure(transaction.error());
+    QSqlQuery query(database_);
+    query.prepare(QStringLiteral(
+        "UPDATE outbox_events SET state='synced', last_error='' WHERE event_id=?"));
+    for (const QByteArray& eventId : eventIds) {
+        query.bindValue(0, eventId);
+        if (!query.exec()) {
+            transaction.rollback();
+            return OperationResult::failure(session_.errorFrom(
+                query.lastError(), QStringLiteral("mark outbox synchronized")));
+        }
+    }
+    return transaction.commit();
+}
+
+OperationResult HistorianRepository::postponeOutbox(
+    const QVector<OutboxEvent>& events, QString diagnostic, const qint64 nowMs) {
+    if (events.isEmpty()) return OperationResult::success();
+    diagnostic = diagnostic.left(1000);
+    TransactionGuard transaction(session_, QStringLiteral("postpone outbox"));
+    if (!transaction.began()) return OperationResult::failure(transaction.error());
+    QSqlQuery query(database_);
+    query.prepare(QStringLiteral(
+        "UPDATE outbox_events SET attempt_count=attempt_count+1, "
+        "next_attempt_at_ms=?, last_error=? WHERE event_id=? AND state='pending'"));
+    for (const OutboxEvent& event : events) {
+        const int shift = std::min(event.attemptCount, 8);
+        const qint64 delayMs = std::min<qint64>(60000, 250LL << shift);
+        query.bindValue(0, nowMs + delayMs);
+        query.bindValue(1, diagnostic);
+        query.bindValue(2, event.eventId);
+        if (!query.exec()) {
+            transaction.rollback();
+            return OperationResult::failure(session_.errorFrom(
+                query.lastError(), QStringLiteral("postpone outbox")));
+        }
+    }
+    return transaction.commit();
+}
+
+OperationResult HistorianRepository::deadLetterOutbox(
+    const QVector<QByteArray>& eventIds, QString diagnostic) {
+    if (eventIds.isEmpty()) return OperationResult::success();
+    diagnostic = diagnostic.left(1000);
+    TransactionGuard transaction(session_, QStringLiteral("dead-letter outbox"));
+    if (!transaction.began()) return OperationResult::failure(transaction.error());
+    QSqlQuery query(database_);
+    query.prepare(QStringLiteral(
+        "UPDATE outbox_events SET state='dead', last_error=? WHERE event_id=?"));
+    for (const QByteArray& eventId : eventIds) {
+        query.bindValue(0, diagnostic);
+        query.bindValue(1, eventId);
+        if (!query.exec()) {
+            transaction.rollback();
+            return OperationResult::failure(session_.errorFrom(
+                query.lastError(), QStringLiteral("dead-letter outbox")));
+        }
+    }
+    return transaction.commit();
+}
+
+ValueResult<int> HistorianRepository::pendingOutboxCount() const {
+    QSqlQuery query(database_);
+    if (!query.exec(QStringLiteral(
+            "SELECT COUNT(*) FROM outbox_events WHERE state='pending'"))
+        || !query.next()) {
+        return {{}, session_.errorFrom(query.lastError(),
+                                       QStringLiteral("count pending outbox"))};
+    }
+    return {query.value(0).toInt(), {}};
+}
+
+QByteArray HistorianRepository::encodeTelemetry(const TelemetryRecord& record) {
+    QCborMap map;
+    map.insert(QStringLiteral("eventId"), record.eventId);
+    map.insert(QStringLiteral("deviceId"), record.deviceId);
+    map.insert(QStringLiteral("deviceName"), record.deviceName);
+    map.insert(QStringLiteral("capturedAtMs"), record.capturedAtMs);
+    map.insert(QStringLiteral("receivedAtMs"), record.receivedAtMs);
+    map.insert(QStringLiteral("temperatureC"), record.temperatureC);
+    map.insert(QStringLiteral("spindleRpm"), record.spindleRpm);
+    map.insert(QStringLiteral("vibration"), record.vibrationMmPerSecond);
+    map.insert(QStringLiteral("loadPercent"), record.loadPercent);
+    map.insert(QStringLiteral("quality"), record.quality);
+    return QCborValue(map).toCbor();
+}
+
+ValueResult<TelemetryRecord> HistorianRepository::decodeTelemetry(
+    const QByteArray& payload) {
+    QCborParserError parserError;
+    const QCborValue value = QCborValue::fromCbor(payload, &parserError);
+    if (parserError.error != QCborError::NoError || !value.isMap()) {
+        return {{}, dataError(QStringLiteral("decode telemetry outbox"),
+                              QStringLiteral("invalid CBOR payload"))};
+    }
+    const QCborMap map = value.toMap();
+    TelemetryRecord record{map.value(QStringLiteral("eventId")).toByteArray(),
+                           map.value(QStringLiteral("deviceId")).toString(),
+                           map.value(QStringLiteral("deviceName")).toString(),
+                           map.value(QStringLiteral("capturedAtMs")).toInteger(),
+                           map.value(QStringLiteral("receivedAtMs")).toInteger(),
+                           map.value(QStringLiteral("temperatureC")).toDouble(),
+                           map.value(QStringLiteral("spindleRpm")).toDouble(),
+                           map.value(QStringLiteral("vibration")).toDouble(),
+                           map.value(QStringLiteral("loadPercent")).toDouble(),
+                           static_cast<int>(map.value(QStringLiteral("quality")).toInteger())};
+    const QString validation = record.validate();
+    if (!validation.isEmpty()) {
+        return {{}, dataError(QStringLiteral("decode telemetry outbox"), validation)};
+    }
+    return {std::move(record), {}};
+}
+
+OperationResult HistorianRepository::upsertDevice(const TelemetryRecord& record) {
+    QSqlQuery query(database_);
+    const QString displayName = record.deviceName.isEmpty() ? record.deviceId
+                                                             : record.deviceName;
+    if (session_.backend() == DatabaseBackend::SQLite) {
+        query.prepare(QStringLiteral(
+            "INSERT INTO devices(device_id, display_name, created_at_ms, updated_at_ms) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT(device_id) DO UPDATE SET "
+            "display_name=excluded.display_name, updated_at_ms=excluded.updated_at_ms"));
+    } else {
+        query.prepare(QStringLiteral(
+            "INSERT INTO devices(device_id, display_name, created_at_ms, updated_at_ms) "
+            "VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE "
+            "display_name=VALUES(display_name), updated_at_ms=VALUES(updated_at_ms)"));
+    }
+    query.addBindValue(record.deviceId);
+    query.addBindValue(displayName);
+    query.addBindValue(record.receivedAtMs);
+    query.addBindValue(record.receivedAtMs);
+    if (!query.exec()) {
+        return OperationResult::failure(session_.errorFrom(
+            query.lastError(), QStringLiteral("upsert device")));
+    }
+    return OperationResult::success();
+}
+
+OperationResult HistorianRepository::insertTelemetry(const TelemetryRecord& record) {
+    QSqlQuery query(database_);
+    if (session_.backend() == DatabaseBackend::SQLite) {
+        query.prepare(QStringLiteral(
+            "INSERT OR IGNORE INTO telemetry_samples("
+            "event_id, device_id, captured_at_ms, received_at_ms, temperature_c, "
+            "spindle_rpm, vibration_mm_s, load_percent, quality) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"));
+    } else {
+        query.prepare(QStringLiteral(
+            "INSERT INTO telemetry_samples("
+            "event_id, device_id, captured_at_ms, received_at_ms, temperature_c, "
+            "spindle_rpm, vibration_mm_s, load_percent, quality) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON DUPLICATE KEY UPDATE event_id=VALUES(event_id)"));
+    }
+    query.addBindValue(record.eventId);
+    query.addBindValue(record.deviceId);
+    query.addBindValue(record.capturedAtMs);
+    query.addBindValue(record.receivedAtMs);
+    query.addBindValue(record.temperatureC);
+    query.addBindValue(record.spindleRpm);
+    query.addBindValue(record.vibrationMmPerSecond);
+    query.addBindValue(record.loadPercent);
+    query.addBindValue(record.quality);
+    if (!query.exec()) {
+        return OperationResult::failure(session_.errorFrom(
+            query.lastError(), QStringLiteral("insert telemetry")));
+    }
+    return OperationResult::success();
+}
+
+OperationResult HistorianRepository::insertOutbox(const TelemetryRecord& record) {
+    QSqlQuery query(database_);
+    query.prepare(QStringLiteral(
+        "INSERT OR IGNORE INTO outbox_events("
+        "event_id, event_type, payload, created_at_ms, next_attempt_at_ms) "
+        "VALUES (?, 'telemetry', ?, ?, 0)"));
+    query.addBindValue(record.eventId);
+    query.addBindValue(encodeTelemetry(record));
+    query.addBindValue(record.receivedAtMs);
+    if (!query.exec()) {
+        return OperationResult::failure(session_.errorFrom(
+            query.lastError(), QStringLiteral("insert outbox")));
+    }
+    return OperationResult::success();
+}
+
+}  // namespace ds::database

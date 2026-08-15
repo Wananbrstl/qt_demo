@@ -1,0 +1,141 @@
+#include "common/DatabaseConfigLoader.h"
+
+#include <QFile>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonParseError>
+
+#include <limits>
+
+namespace ds::database {
+namespace {
+
+bool integer(const QJsonObject& object, const QString& key, int* target,
+             QString* error) {
+    if (!object.contains(key)) return true;
+    const QJsonValue value = object.value(key);
+    if (!value.isDouble()) {
+        *error = QStringLiteral("%1 must be an integer").arg(key);
+        return false;
+    }
+    const double raw = value.toDouble();
+    const int converted = value.toInt(std::numeric_limits<int>::min());
+    if (raw != static_cast<double>(converted)) {
+        *error = QStringLiteral("%1 is outside the integer range").arg(key);
+        return false;
+    }
+    *target = converted;
+    return true;
+}
+
+bool boolean(const QJsonObject& object, const QString& key, bool* target,
+             QString* error) {
+    if (!object.contains(key)) return true;
+    if (!object.value(key).isBool()) {
+        *error = QStringLiteral("%1 must be boolean").arg(key);
+        return false;
+    }
+    *target = object.value(key).toBool();
+    return true;
+}
+
+bool string(const QJsonObject& object, const QString& key, QString* target,
+            QString* error) {
+    if (!object.contains(key)) return true;
+    if (!object.value(key).isString()) {
+        *error = QStringLiteral("%1 must be a string").arg(key);
+        return false;
+    }
+    *target = object.value(key).toString();
+    return true;
+}
+
+QJsonObject object(const QJsonObject& root, const QString& key, QString* error) {
+    if (!root.contains(key)) return {};
+    if (!root.value(key).isObject()) {
+        *error = QStringLiteral("%1 must be an object").arg(key);
+        return {};
+    }
+    return root.value(key).toObject();
+}
+
+}  // namespace
+
+ConfigLoadResult DatabaseConfigLoader::fromJson(const QByteArray& json) {
+    ConfigLoadResult result;
+    QJsonParseError parseError;
+    const QJsonDocument document = QJsonDocument::fromJson(json, &parseError);
+    if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
+        result.error = QStringLiteral("invalid JSON at offset %1: %2")
+                           .arg(parseError.offset).arg(parseError.errorString());
+        return result;
+    }
+    QString error;
+    const QJsonObject root = document.object();
+    const QJsonObject sqlite = object(root, QStringLiteral("sqlite"), &error);
+    const QJsonObject mysql = object(root, QStringLiteral("mysql"), &error);
+    const QJsonObject batching = object(root, QStringLiteral("batching"), &error);
+    const QJsonObject sync = object(root, QStringLiteral("synchronization"), &error);
+    if (!error.isEmpty()) {
+        result.error = error;
+        return result;
+    }
+
+    int mysqlPort = result.config.mysql.port;
+    if (!string(sqlite, QStringLiteral("path"), &result.config.sqlite.path, &error)
+        || !integer(sqlite, QStringLiteral("busyTimeoutMs"),
+                    &result.config.sqlite.busyTimeoutMs, &error)
+        || !integer(sqlite, QStringLiteral("walAutoCheckpointPages"),
+                    &result.config.sqlite.walAutoCheckpointPages, &error)
+        || !boolean(sqlite, QStringLiteral("enableWal"),
+                    &result.config.sqlite.enableWal, &error)
+        || !boolean(sqlite, QStringLiteral("synchronousFull"),
+                    &result.config.sqlite.synchronousFull, &error)
+        || !boolean(mysql, QStringLiteral("enabled"), &result.config.mysql.enabled, &error)
+        || !string(mysql, QStringLiteral("host"), &result.config.mysql.host, &error)
+        || !integer(mysql, QStringLiteral("port"), &mysqlPort, &error)
+        || !string(mysql, QStringLiteral("database"), &result.config.mysql.database, &error)
+        || !string(mysql, QStringLiteral("user"), &result.config.mysql.user, &error)
+        || !string(mysql, QStringLiteral("passwordEnvironment"),
+                   &result.config.mysql.passwordEnvironment, &error)
+        || !integer(mysql, QStringLiteral("connectTimeoutSeconds"),
+                    &result.config.mysql.connectTimeoutSeconds, &error)
+        || !integer(mysql, QStringLiteral("readTimeoutSeconds"),
+                    &result.config.mysql.readTimeoutSeconds, &error)
+        || !integer(mysql, QStringLiteral("writeTimeoutSeconds"),
+                    &result.config.mysql.writeTimeoutSeconds, &error)
+        || !string(mysql, QStringLiteral("sslCa"), &result.config.mysql.sslCa, &error)
+        || !string(mysql, QStringLiteral("sslCertificate"),
+                   &result.config.mysql.sslCertificate, &error)
+        || !string(mysql, QStringLiteral("sslKey"), &result.config.mysql.sslKey, &error)
+        || !integer(batching, QStringLiteral("flushIntervalMs"),
+                    &result.config.flushIntervalMs, &error)
+        || !integer(batching, QStringLiteral("maximumBatchRows"),
+                    &result.config.maximumBatchRows, &error)
+        || !integer(batching, QStringLiteral("maximumPendingSamples"),
+                    &result.config.maximumPendingSamples, &error)
+        || !integer(sync, QStringLiteral("intervalMs"),
+                    &result.config.syncIntervalMs, &error)
+        || !integer(sync, QStringLiteral("batchRows"),
+                    &result.config.syncBatchRows, &error)) {
+        result.error = error;
+        return result;
+    }
+    if (mysqlPort < 1 || mysqlPort > 65535) {
+        result.error = QStringLiteral("mysql.port must be in [1, 65535]");
+        return result;
+    }
+    result.config.mysql.port = static_cast<quint16>(mysqlPort);
+    result.error = result.config.validate();
+    return result;
+}
+
+ConfigLoadResult DatabaseConfigLoader::fromFile(const QString& path) {
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        return {{}, QStringLiteral("cannot open %1: %2").arg(path, file.errorString())};
+    }
+    return fromJson(file.readAll());
+}
+
+}  // namespace ds::database

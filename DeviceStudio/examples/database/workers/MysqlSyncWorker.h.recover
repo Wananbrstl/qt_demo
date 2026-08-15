@@ -1,0 +1,49 @@
+#pragma once
+
+#include "common/DbTypes.h"
+
+#include <QObject>
+
+#include <memory>
+
+namespace ds::database {
+
+class DatabaseSession;
+class HistorianRepository;
+
+// Owns the only QMYSQL connection used by the example. All potentially
+// blocking network/database work stays in this dedicated thread.
+class MysqlSyncWorker final : public QObject {
+    Q_OBJECT
+
+public:
+    explicit MysqlSyncWorker(QObject* parent = nullptr);
+    ~MysqlSyncWorker() override;
+
+public slots:
+    void initialize(ds::database::MysqlConfig config);
+    void synchronize(QVector<ds::database::OutboxEvent> events);
+    void shutdown();
+
+signals:
+    void initialized(bool success, QString message);
+    void onlineChanged(bool online);
+    void payloadRejected(ds::database::EventIdList eventIds, QString diagnostic);
+    void batchSucceeded(ds::database::EventIdList eventIds);
+    void batchFailed(QVector<ds::database::OutboxEvent> events, QString diagnostic);
+    void logMessage(QString category, QString message);
+    void finished();
+
+private:
+    [[nodiscard]] OperationResult ensureConnection();
+    void discardConnection();
+
+    MysqlConfig config_;
+    std::unique_ptr<DatabaseSession> session_;
+    std::unique_ptr<HistorianRepository> repository_;
+    qint64 nextConnectionAttemptMs_{};
+    bool initialized_{};
+    bool shuttingDown_{};
+};
+
+}  // namespace ds::database

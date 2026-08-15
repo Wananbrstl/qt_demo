@@ -1,0 +1,21 @@
+#pragma once
+
+#include "common/DbTypes.h"
+
+#include <QByteArray>
+
+namespace ds::database {
+
+struct ConfigLoadResult final {
+    HistorianConfig config;
+    QString error;
+    [[nodiscard]] bool succeeded() const noexcept { return error.isEmpty(); }
+};
+
+class DatabaseConfigLoader final {
+public:
+    [[nodiscard]] static ConfigLoadResult fromJson(const QByteArray& json);
+    [[nodiscard]] static ConfigLoadResult fromFile(const QString& path);
+};
+
+}  // namespace ds::database

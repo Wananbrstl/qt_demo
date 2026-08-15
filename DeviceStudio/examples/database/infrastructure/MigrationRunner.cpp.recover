@@ -1,0 +1,103 @@
+#include "infrastructure/MigrationRunner.h"
+
+#include "infrastructure/DatabaseSession.h"
+#include "infrastructure/TransactionGuard.h"
+
+#include <QCryptographicHash>
+#include <QDateTime>
+#include <QHash>
+#include <QSqlError>
+#include <QSqlQuery>
+#include <QVariant>
+
+namespace ds::database {
+
+QString MigrationRunner::checksum(const Migration& migration) {
+    QCryptographicHash hash(QCryptographicHash::Sha256);
+    hash.addData(QByteArray::number(migration.version));
+    hash.addData("\n", 1);
+    hash.addData(migration.name.toUtf8());
+    for (const QString& statement : migration.statements) {
+        hash.addData("\n", 1);
+        hash.addData(statement.trimmed().toUtf8());
+    }
+    return QString::fromLatin1(hash.result().toHex());
+}
+
+OperationResult MigrationRunner::apply(DatabaseSession& session,
+                                       const QVector<Migration>& migrations) {
+    QSqlDatabase database = session.database();
+    QSqlQuery bootstrap(database);
+    if (!bootstrap.exec(QStringLiteral(
+            "CREATE TABLE IF NOT EXISTS schema_migrations("
+            "version INTEGER PRIMARY KEY, name VARCHAR(255) NOT NULL, "
+            "checksum VARCHAR(64) NOT NULL, applied_at_ms BIGINT NOT NULL)"))) {
+        return OperationResult::failure(session.errorFrom(
+            bootstrap.lastError(), QStringLiteral("create schema_migrations")));
+    }
+
+    QHash<int, QString> applied;
+    QSqlQuery existing(database);
+    if (!existing.exec(QStringLiteral(
+            "SELECT version, checksum FROM schema_migrations ORDER BY version"))) {
+        return OperationResult::failure(session.errorFrom(
+            existing.lastError(), QStringLiteral("read applied migrations")));
+    }
+    while (existing.next()) applied.insert(existing.value(0).toInt(), existing.value(1).toString());
+    existing.finish();
+
+    int previousVersion = 0;
+    for (const Migration& migration : migrations) {
+        if (migration.version <= previousVersion || migration.version < 1
+            || migration.name.trimmed().isEmpty() || migration.statements.isEmpty()) {
+            return OperationResult::failure(session.configurationError(
+                QStringLiteral("validate migrations"),
+                QStringLiteral("migration versions must be positive, ordered, and non-empty")));
+        }
+        previousVersion = migration.version;
+        const QString expectedChecksum = checksum(migration);
+        if (applied.contains(migration.version)) {
+            if (applied.value(migration.version) != expectedChecksum) {
+                DbError error{DbErrorCategory::Migration,
+                              QStringLiteral("verify migration %1").arg(migration.version),
+                              QStringLiteral("applied migration checksum changed"), {}, {}, false};
+                return OperationResult::failure(std::move(error));
+            }
+            continue;
+        }
+
+        TransactionGuard transaction(session,
+                                     QStringLiteral("migration %1").arg(migration.version));
+        if (!transaction.began()) return OperationResult::failure(transaction.error());
+        QSqlQuery query(database);
+        for (const QString& statement : migration.statements) {
+            if (!query.exec(statement)) {
+                transaction.rollback();
+                DbError error = session.errorFrom(
+                    query.lastError(), QStringLiteral("execute migration %1")
+                                           .arg(migration.version));
+                error.category = DbErrorCategory::Migration;
+                error.retryable = false;
+                return OperationResult::failure(std::move(error));
+            }
+        }
+        query.prepare(QStringLiteral(
+            "INSERT INTO schema_migrations(version, name, checksum, applied_at_ms) "
+            "VALUES (?, ?, ?, ?)"));
+        query.addBindValue(migration.version);
+        query.addBindValue(migration.name);
+        query.addBindValue(expectedChecksum);
+        query.addBindValue(QDateTime::currentMSecsSinceEpoch());
+        if (!query.exec()) {
+            transaction.rollback();
+            return OperationResult::failure(session.errorFrom(
+                query.lastError(), QStringLiteral("record migration %1")
+                                       .arg(migration.version)));
+        }
+        const OperationResult committed = transaction.commit();
+        if (!committed.succeeded()) return committed;
+    }
+    return OperationResult::success();
+}
+
+}  // namespace ds::database

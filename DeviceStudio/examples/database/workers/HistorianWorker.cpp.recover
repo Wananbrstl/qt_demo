@@ -1,0 +1,236 @@
+#include "workers/HistorianWorker.h"
+
+#include "infrastructure/DatabaseSession.h"
+#include "infrastructure/MigrationRunner.h"
+#include "repositories/HistorianRepository.h"
+#include "schema/HistorianSchema.h"
+
+#include <QDateTime>
+#include <QThread>
+#include <QTimer>
+
+#include <algorithm>
+#include <utility>
+
+namespace ds::database {
+
+HistorianWorker::HistorianWorker(QObject* parent) : QObject(parent) {}
+HistorianWorker::~HistorianWorker() = default;
+
+void HistorianWorker::initialize(HistorianConfig config) {
+    Q_ASSERT(QThread::currentThread() == thread());
+    if (initialized_) {
+        emit initialized(true, QStringLiteral("historian already initialized"));
+        return;
+    }
+    const QString validation = config.validate();
+    if (!validation.isEmpty()) {
+        emit initialized(false, validation);
+        return;
+    }
+    config_ = std::move(config);
+    localSession_ = std::make_unique<DatabaseSession>(
+        DatabaseBackend::SQLite, QStringLiteral("local-writer"));
+    OperationResult result = localSession_->open(config_.sqlite);
+    if (!result.succeeded()) {
+        emit initialized(false, result.error.diagnosticText());
+        localSession_.reset();
+        return;
+    }
+    result = MigrationRunner::apply(*localSession_, HistorianSchema::sqliteMigrations());
+    if (!result.succeeded()) {
+        emit initialized(false, result.error.diagnosticText());
+        localSession_->close();
+        localSession_.reset();
+        return;
+    }
+    localRepository_ = std::make_unique<HistorianRepository>(*localSession_);
+
+    flushTimer_ = new QTimer(this);
+    flushTimer_->setInterval(config_.flushIntervalMs);
+    connect(flushTimer_, &QTimer::timeout, this, &HistorianWorker::flushLocalBatch);
+    flushTimer_->start();
+    syncTimer_ = new QTimer(this);
+    syncTimer_->setInterval(config_.syncIntervalMs);
+    connect(syncTimer_, &QTimer::timeout, this,
+            &HistorianWorker::synchronizeOutboxBatch);
+    if (config_.mysql.enabled) syncTimer_->start();
+    initialized_ = true;
+    emit logMessage(QStringLiteral("database"),
+                    QStringLiteral("SQLite %1 ready at %2")
+                        .arg(localSession_->engineVersion(), config_.sqlite.path));
+    emit initialized(true, QStringLiteral("local historian ready"));
+    publishMetrics();
+}
+
+void HistorianWorker::enqueueTelemetry(TelemetryRecord record) {
+    Q_ASSERT(QThread::currentThread() == thread());
+    if (!initialized_ || shuttingDown_) return;
+    const QString validation = record.validate();
+    if (!validation.isEmpty()) {
+        ++metrics_.rejectedSamples;
+        emit logMessage(QStringLiteral("data"), validation);
+        publishMetrics();
+        return;
+    }
+    if (pending_.size() >= config_.maximumPendingSamples) {
+        pending_.dequeue();
+        ++metrics_.rejectedSamples;
+        emit logMessage(QStringLiteral("backpressure"),
+                        QStringLiteral("memory queue full; oldest telemetry dropped"));
+    }
+    pending_.enqueue(std::move(record));
+    ++metrics_.acceptedSamples;
+    metrics_.pendingMemorySamples = pending_.size();
+    if (pending_.size() >= config_.maximumBatchRows) flushLocalBatch();
+}
+
+void HistorianWorker::queryHistory(HistoryQuery query) {
+    if (!initialized_) {
+        DbError error{DbErrorCategory::Configuration, QStringLiteral("query history"),
+                      QStringLiteral("historian is not initialized"), {}, {}, false};
+        emit historyReady(std::move(query), {}, error);
+        return;
+    }
+    ValueResult<HistoryPage> result = localRepository_->queryHistory(query);
+    emit historyReady(std::move(query),
+                      result.value ? std::move(*result.value) : HistoryPage{},
+                      result.error);
+}
+
+void HistorianWorker::flushNow() { flushLocalBatch(); }
+void HistorianWorker::synchronizeNow() { synchronizeOutboxBatch(); }
+
+void HistorianWorker::shutdown() {
+    Q_ASSERT(QThread::currentThread() == thread());
+    if (shuttingDown_) return;
+    shuttingDown_ = true;
+    if (flushTimer_) flushTimer_->stop();
+    if (syncTimer_) syncTimer_->stop();
+    for (int batch = 0; batch < 20 && !pending_.isEmpty(); ++batch) {
+        const int before = pending_.size();
+        flushLocalBatch();
+        if (pending_.size() >= before) break;
+    }
+    if (!pending_.isEmpty()) {
+        emit logMessage(QStringLiteral("shutdown"),
+                        QStringLiteral("%1 telemetry records remain in memory")
+                            .arg(pending_.size()));
+    }
+    localRepository_.reset();
+    if (localSession_) localSession_->close();
+    localSession_.reset();
+    initialized_ = false;
+    emit finished();
+}
+
+void HistorianWorker::flushLocalBatch() {
+    if (!initialized_ || pending_.isEmpty() || !localRepository_) return;
+    QVector<TelemetryRecord> batch;
+    const int count = std::min(config_.maximumBatchRows, pending_.size());
+    batch.reserve(count);
+    for (int index = 0; index < count; ++index) batch.push_back(pending_.dequeue());
+
+    const qint64 started = QDateTime::currentMSecsSinceEpoch();
+    const OperationResult result = localRepository_->persistLocalBatch(
+        batch, config_.mysql.enabled);
+    metrics_.lastFlushMs = QDateTime::currentMSecsSinceEpoch() - started;
+    if (!result.succeeded()) {
+        ++metrics_.storageFailures;
+        for (auto iterator = batch.crbegin(); iterator != batch.crend(); ++iterator) {
+            pending_.prepend(*iterator);
+        }
+        emit logMessage(QStringLiteral("sqlite"), result.error.diagnosticText());
+    } else {
+        metrics_.persistedSamples += static_cast<quint64>(batch.size());
+    }
+    metrics_.pendingMemorySamples = pending_.size();
+    publishMetrics();
+}
+
+void HistorianWorker::synchronizeOutboxBatch() {
+    if (!initialized_ || shuttingDown_ || !config_.mysql.enabled
+        || !localRepository_ || synchronizationInFlight_) {
+        return;
+    }
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    ValueResult<QVector<OutboxEvent>> pending = localRepository_->pendingOutbox(
+        config_.syncBatchRows, now);
+    if (!pending.succeeded()) {
+        ++metrics_.synchronizationFailures;
+        emit logMessage(QStringLiteral("outbox"), pending.error.diagnosticText());
+        publishMetrics();
+        return;
+    }
+    if (pending.value->isEmpty()) {
+        publishMetrics();
+        return;
+    }
+    synchronizationInFlight_ = true;
+    emit outboxBatchReady(std::move(*pending.value));
+    publishMetrics();
+}
+
+void HistorianWorker::markSynchronized(EventIdList eventIds) {
+    if (!initialized_ || !localRepository_) return;
+    const qint64 started = QDateTime::currentMSecsSinceEpoch();
+    const OperationResult result = localRepository_->markOutboxSynchronized(eventIds);
+    metrics_.lastSyncMs = QDateTime::currentMSecsSinceEpoch() - started;
+    synchronizationInFlight_ = false;
+    if (!result.succeeded()) {
+        ++metrics_.synchronizationFailures;
+        emit logMessage(QStringLiteral("outbox"), result.error.diagnosticText());
+    } else {
+        metrics_.synchronizedSamples += static_cast<quint64>(eventIds.size());
+    }
+    publishMetrics();
+}
+
+void HistorianWorker::postponeSynchronization(QVector<OutboxEvent> events,
+                                              QString diagnostic) {
+    if (!initialized_ || !localRepository_) return;
+    const QString detail = diagnostic;
+    const OperationResult result = localRepository_->postponeOutbox(
+        events, std::move(diagnostic), QDateTime::currentMSecsSinceEpoch());
+    synchronizationInFlight_ = false;
+    ++metrics_.synchronizationFailures;
+    if (!result.succeeded()) {
+        emit logMessage(QStringLiteral("outbox"), result.error.diagnosticText());
+    } else {
+        emit logMessage(QStringLiteral("mysql"),
+                        QStringLiteral("batch postponed: %1").arg(detail));
+    }
+    publishMetrics();
+}
+
+void HistorianWorker::deadLetterPartial(EventIdList eventIds, QString diagnostic) {
+    if (!initialized_ || !localRepository_) return;
+    const QString detail = diagnostic;
+    const OperationResult result = localRepository_->deadLetterOutbox(
+        eventIds, std::move(diagnostic));
+    if (!result.succeeded()) {
+        ++metrics_.synchronizationFailures;
+        emit logMessage(QStringLiteral("outbox"), result.error.diagnosticText());
+    } else if (!eventIds.isEmpty()) {
+        emit logMessage(QStringLiteral("outbox"),
+                        QStringLiteral("%1 corrupt event(s) dead-lettered: %2")
+                            .arg(eventIds.size()).arg(detail));
+    }
+    publishMetrics();
+}
+
+void HistorianWorker::setMysqlOnline(const bool online) {
+    metrics_.mysqlOnline = online;
+    publishMetrics();
+}
+
+void HistorianWorker::publishMetrics() {
+    metrics_.pendingMemorySamples = pending_.size();
+    if (localRepository_) {
+        const ValueResult<int> count = localRepository_->pendingOutboxCount();
+        if (count.succeeded()) metrics_.pendingOutboxEvents = *count.value;
+    }
+    emit metricsChanged(metrics_);
+}
+
+}  // namespace ds::database

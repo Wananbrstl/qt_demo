@@ -1,0 +1,77 @@
+#include "common/DbTypes.h"
+
+#include <QStringList>
+#include <QtGlobal>
+
+namespace ds::database {
+
+QString HistorianConfig::validate() const {
+    if (sqlite.path.trimmed().isEmpty()) {
+        return QStringLiteral("sqlite.path must not be empty");
+    }
+    if (sqlite.busyTimeoutMs < 0 || sqlite.walAutoCheckpointPages < 0) {
+        return QStringLiteral("SQLite timeout and checkpoint values must be non-negative");
+    }
+    if (flushIntervalMs < 10 || maximumBatchRows < 1
+        || maximumPendingSamples < maximumBatchRows) {
+        return QStringLiteral("invalid local batching limits");
+    }
+    if (syncIntervalMs < 50 || syncBatchRows < 1) {
+        return QStringLiteral("invalid synchronization limits");
+    }
+    if (mysql.enabled) {
+        if (mysql.host.trimmed().isEmpty() || mysql.port == 0
+            || mysql.database.trimmed().isEmpty() || mysql.user.trimmed().isEmpty()
+            || mysql.passwordEnvironment.trimmed().isEmpty()) {
+            return QStringLiteral("enabled MySQL configuration is incomplete");
+        }
+        if (mysql.connectTimeoutSeconds < 1 || mysql.readTimeoutSeconds < 1
+            || mysql.writeTimeoutSeconds < 1) {
+            return QStringLiteral("MySQL timeouts must be positive");
+        }
+    }
+    return {};
+}
+
+QString DbError::diagnosticText() const {
+    QStringList fields;
+    if (!operation.isEmpty()) fields << QStringLiteral("operation=%1").arg(operation);
+    if (!nativeCode.isEmpty()) fields << QStringLiteral("native=%1").arg(nativeCode);
+    if (!driverText.isEmpty()) fields << QStringLiteral("driver=%1").arg(driverText);
+    if (!databaseText.isEmpty()) fields << QStringLiteral("database=%1").arg(databaseText);
+    fields << QStringLiteral("retryable=%1").arg(retryable ? QStringLiteral("true")
+                                                            : QStringLiteral("false"));
+    return fields.join(QStringLiteral("; "));
+}
+
+QString TelemetryRecord::validate() const {
+    if (eventId.size() != 16) return QStringLiteral("eventId must contain 16 bytes");
+    if (deviceId.trimmed().isEmpty() || deviceId.size() > 128) {
+        return QStringLiteral("deviceId must contain 1..128 characters");
+    }
+    if (capturedAtMs <= 0 || receivedAtMs <= 0) {
+        return QStringLiteral("telemetry timestamps must be positive UTC epoch milliseconds");
+    }
+    if (!qIsFinite(temperatureC) || !qIsFinite(spindleRpm)
+        || !qIsFinite(vibrationMmPerSecond) || !qIsFinite(loadPercent)) {
+        return QStringLiteral("telemetry numeric fields must be finite");
+    }
+    if (quality < 0 || quality > 255) {
+        return QStringLiteral("quality must be in [0, 255]");
+    }
+    return {};
+}
+
+void registerDatabaseMetaTypes() {
+    qRegisterMetaType<HistorianConfig>();
+    qRegisterMetaType<DbError>();
+    qRegisterMetaType<TelemetryRecord>();
+    qRegisterMetaType<HistoryQuery>();
+    qRegisterMetaType<HistoryPage>();
+    qRegisterMetaType<HistorianMetrics>();
+    qRegisterMetaType<OutboxEvent>();
+    qRegisterMetaType<QVector<OutboxEvent>>();
+    qRegisterMetaType<EventIdList>();
+}
+
+}  // namespace ds::database

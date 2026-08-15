@@ -1,0 +1,13 @@
+#pragma once
+
+#include "infrastructure/MigrationRunner.h"
+
+namespace ds::database {
+
+class HistorianSchema final {
+public:
+    [[nodiscard]] static QVector<Migration> sqliteMigrations();
+    [[nodiscard]] static QVector<Migration> mysqlMigrations();
+};
+
+}  // namespace ds::database

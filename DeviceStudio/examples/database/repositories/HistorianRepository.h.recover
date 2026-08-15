@@ -1,0 +1,44 @@
+#pragma once
+
+#include "common/DbTypes.h"
+
+#include <QSqlDatabase>
+
+namespace ds::database {
+
+class DatabaseSession;
+
+class HistorianRepository final {
+public:
+    explicit HistorianRepository(DatabaseSession& session);
+
+    [[nodiscard]] OperationResult persistLocalBatch(
+        const QVector<TelemetryRecord>& records, bool stageForSynchronization);
+    [[nodiscard]] OperationResult persistCentralBatch(
+        const QVector<TelemetryRecord>& records);
+    [[nodiscard]] ValueResult<HistoryPage> queryHistory(const HistoryQuery& query) const;
+
+    [[nodiscard]] ValueResult<QVector<OutboxEvent>> pendingOutbox(
+        int limit, qint64 nowMs) const;
+    [[nodiscard]] OperationResult markOutboxSynchronized(
+        const QVector<QByteArray>& eventIds);
+    [[nodiscard]] OperationResult postponeOutbox(
+        const QVector<OutboxEvent>& events, QString diagnostic, qint64 nowMs);
+    [[nodiscard]] OperationResult deadLetterOutbox(
+        const QVector<QByteArray>& eventIds, QString diagnostic);
+    [[nodiscard]] ValueResult<int> pendingOutboxCount() const;
+
+    [[nodiscard]] static QByteArray encodeTelemetry(const TelemetryRecord& record);
+    [[nodiscard]] static ValueResult<TelemetryRecord> decodeTelemetry(
+        const QByteArray& payload);
+
+private:
+    [[nodiscard]] OperationResult upsertDevice(const TelemetryRecord& record);
+    [[nodiscard]] OperationResult insertTelemetry(const TelemetryRecord& record);
+    [[nodiscard]] OperationResult insertOutbox(const TelemetryRecord& record);
+
+    DatabaseSession& session_;
+    QSqlDatabase database_;
+};
+
+}  // namespace ds::database

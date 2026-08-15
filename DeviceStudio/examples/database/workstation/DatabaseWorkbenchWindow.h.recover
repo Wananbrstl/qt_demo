@@ -1,0 +1,74 @@
+#pragma once
+
+#include "common/DbTypes.h"
+
+#include <QMainWindow>
+#include <QThread>
+
+class QCloseEvent;
+class QLabel;
+class QLineEdit;
+class QPlainTextEdit;
+class QPushButton;
+class QSpinBox;
+class QStandardItemModel;
+class QTableView;
+class QTimer;
+
+namespace ds::database {
+
+class HistorianWorker;
+class MysqlSyncWorker;
+
+class DatabaseWorkbenchWindow final : public QMainWindow {
+    Q_OBJECT
+
+public:
+    explicit DatabaseWorkbenchWindow(HistorianConfig config,
+                                     QWidget* parent = nullptr);
+    ~DatabaseWorkbenchWindow() override;
+
+signals:
+    void telemetryGenerated(ds::database::TelemetryRecord record);
+    void historyRequested(ds::database::HistoryQuery query);
+    void flushRequested();
+    void syncRequested();
+
+protected:
+    void closeEvent(QCloseEvent* event) override;
+
+private slots:
+    void toggleGenerator();
+    void generateSample();
+    void requestHistory();
+    void showHistory(ds::database::HistoryQuery query,
+                     ds::database::HistoryPage page,
+                     ds::database::DbError error);
+    void showMetrics(ds::database::HistorianMetrics metrics);
+    void appendLog(QString category, QString message);
+
+private:
+    void buildUi();
+    void startWorker();
+    void stopWorkers();
+
+    HistorianConfig config_;
+    QThread databaseThread_;
+    QThread mysqlThread_;
+    HistorianWorker* worker_{};
+    MysqlSyncWorker* mysqlWorker_{};
+    QTimer* generator_{};
+    QStandardItemModel* model_{};
+    QTableView* table_{};
+    QLineEdit* deviceEdit_{};
+    QSpinBox* minutesSpin_{};
+    QPushButton* generatorButton_{};
+    QPushButton* queryButton_{};
+    QLabel* statusValue_{};
+    QLabel* metricsValue_{};
+    QPlainTextEdit* log_{};
+    quint64 generatedCount_{};
+    bool shutdownStarted_{};
+};
+
+}  // namespace ds::database
