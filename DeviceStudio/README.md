@@ -1,6 +1,6 @@
 # DeviceStudio
 
-DeviceStudio is an industrial-style learning workstation for Qt 6, asynchronous
+DeviceStudio is an industrial-style learning workstation for Qt 5.15, asynchronous
 TCP, and SQLite. It is intentionally small enough to study end to end while
 retaining production-oriented boundaries: UI widgets do not own sockets or SQL
 connections, protocol parsing is tested independently, and background resources
@@ -24,7 +24,7 @@ Run the following yourself because `sudo` may require your password:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y qt6-base-dev qt6-base-dev-tools libqt6sql6-sqlite
+sudo apt-get install -y qtbase5-dev qtbase5-dev-tools qt5-qmake libqt5sql5-sqlite
 ```
 
 Alternatively, `bash scripts/bootstrap-wsl.sh` installs the complete toolchain,

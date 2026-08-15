@@ -22,7 +22,8 @@ QByteArray magicBytes() {
 }  // namespace
 
 QByteArray FrameCodec::encode(const Frame& frame) {
-    if (frame.payload.size() > std::numeric_limits<quint32>::max()) {
+    if (static_cast<quint64>(frame.payload.size())
+        > std::numeric_limits<quint32>::max()) {
         return {};
     }
 
@@ -97,7 +98,7 @@ std::optional<domain::TelemetrySample> FrameCodec::deserializeTelemetry(
         load.toDouble()};
 }
 
-FrameDecoder::FrameDecoder(const qsizetype maximumFrameBytes)
+FrameDecoder::FrameDecoder(const int maximumFrameBytes)
     : maximumFrameBytes_(qMax(maximumFrameBytes, FrameCodec::headerBytes)) {}
 
 DecodeBatch FrameDecoder::append(const QByteArray& bytes) {
@@ -105,12 +106,12 @@ DecodeBatch FrameDecoder::append(const QByteArray& bytes) {
     buffer_.append(bytes);
 
     while (buffer_.size() >= FrameCodec::headerBytes) {
-        const qsizetype magicPosition = findMagic();
+        const int magicPosition = findMagic();
         if (magicPosition != 0) {
             if (magicPosition < 0) {
                 // Keep the final three bytes because they may be the beginning
                 // of the four-byte magic sequence split across TCP reads.
-                const qsizetype discardCount = qMax<qsizetype>(0, buffer_.size() - 3);
+                const int discardCount = qMax(0, buffer_.size() - 3);
                 if (discardCount > 0) {
                     buffer_.remove(0, discardCount);
                     batch.errors.push_back({
@@ -157,24 +158,25 @@ DecodeBatch FrameDecoder::append(const QByteArray& bytes) {
             continue;
         }
 
-        const qsizetype totalBytes = FrameCodec::headerBytes
-            + static_cast<qsizetype>(payloadSize);
-        if (totalBytes > maximumFrameBytes_) {
+        const quint64 totalBytes64 = static_cast<quint64>(FrameCodec::headerBytes)
+            + payloadSize;
+        if (totalBytes64 > static_cast<quint64>(maximumFrameBytes_)) {
             buffer_.remove(0, 4);
             batch.errors.push_back({
                 DecodeErrorCode::FrameTooLarge,
                 QStringLiteral("Frame size %1 exceeds configured maximum %2")
-                    .arg(totalBytes)
+                    .arg(totalBytes64)
                     .arg(maximumFrameBytes_)});
             continue;
         }
+        const int totalBytes = static_cast<int>(totalBytes64);
 
         if (buffer_.size() < totalBytes) {
             break;
         }
 
         const QByteArray payload = buffer_.mid(FrameCodec::headerBytes,
-                                               static_cast<qsizetype>(payloadSize));
+                                               static_cast<int>(payloadSize));
         const QByteArray checksumInput = buffer_.left(FrameCodec::checksumOffset) + payload;
         if (FrameCodec::crc32(checksumInput) != checksum) {
             buffer_.remove(0, totalBytes);
@@ -196,7 +198,7 @@ void FrameDecoder::reset() {
     buffer_.clear();
 }
 
-qsizetype FrameDecoder::findMagic() const {
+int FrameDecoder::findMagic() const {
     return buffer_.indexOf(magicBytes());
 }
 

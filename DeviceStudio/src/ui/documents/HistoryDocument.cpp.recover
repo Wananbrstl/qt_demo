@@ -72,7 +72,7 @@ void HistoryDocument::onHistoryReady(const domain::HistoryQuery query,
     if (!(query.deviceId == deviceId_)) {
         return;
     }
-    const qsizetype count = samples.size();
+    const int count = samples.size();
     model_->setSamples(std::move(samples));
     resultLabel_->setText(tr("%1 rows").arg(count));
 }

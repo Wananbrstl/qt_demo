@@ -30,7 +30,7 @@ void ProtocolTest::roundTripFrame() {
 void ProtocolTest::handlesEveryFragmentBoundary() {
     const QByteArray encoded = FrameCodec::encode(
         {MessageType::CommandRequest, 0, 100, QByteArrayLiteral("abcdef")});
-    for (qsizetype split = 1; split < encoded.size(); ++split) {
+    for (int split = 1; split < encoded.size(); ++split) {
         FrameDecoder decoder;
         const DecodeBatch first = decoder.append(encoded.left(split));
         QVERIFY(first.frames.isEmpty());
@@ -53,7 +53,8 @@ void ProtocolTest::handlesCoalescedFrames() {
 void ProtocolTest::rejectsCorruptedChecksum() {
     QByteArray bytes = FrameCodec::encode(
         {MessageType::Telemetry, 0, 7, QByteArrayLiteral("payload")});
-    bytes[FrameCodec::headerBytes] ^= char{0x01};
+    bytes[FrameCodec::headerBytes] =
+        static_cast<char>(bytes.at(FrameCodec::headerBytes) ^ 0x01);
     FrameDecoder decoder;
     const DecodeBatch batch = decoder.append(bytes);
     QVERIFY(batch.frames.isEmpty());

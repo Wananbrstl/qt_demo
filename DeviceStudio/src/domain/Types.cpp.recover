@@ -4,7 +4,7 @@
 
 namespace ds::domain {
 
-size_t qHash(const DeviceId& id, const size_t seed) noexcept {
+uint qHash(const DeviceId& id, const uint seed) noexcept {
     return ::qHash(id.value, seed);
 }
 

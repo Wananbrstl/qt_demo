@@ -17,10 +17,12 @@ struct DeviceId final {
     QString value;
 
     [[nodiscard]] bool isValid() const noexcept { return !value.trimmed().isEmpty(); }
-    friend bool operator==(const DeviceId&, const DeviceId&) = default;
+    friend bool operator==(const DeviceId& lhs, const DeviceId& rhs) noexcept {
+        return lhs.value == rhs.value;
+    }
 };
 
-[[nodiscard]] size_t qHash(const DeviceId& id, size_t seed = 0) noexcept;
+[[nodiscard]] uint qHash(const DeviceId& id, uint seed = 0) noexcept;
 
 struct DeviceEndpoint final {
     QString host{"127.0.0.1"};

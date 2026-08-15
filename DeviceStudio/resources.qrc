@@ -1,0 +1,6 @@
+<RCC>
+    <qresource prefix="/">
+        <file>config/application.json</file>
+        <file>migrations/001_initial.sql</file>
+    </qresource>
+</RCC>

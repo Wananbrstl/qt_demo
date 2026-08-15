@@ -17,7 +17,7 @@ TelemetryChartWidget::TelemetryChartWidget(QWidget* parent)
 }
 
 void TelemetryChartWidget::appendTemperature(const double value) {
-    constexpr qsizetype maximumPoints = 180;
+    constexpr int maximumPoints = 180;
     temperatures_.push_back(value);
     if (temperatures_.size() > maximumPoints) {
         temperatures_.remove(0, temperatures_.size() - maximumPoints);
@@ -46,7 +46,7 @@ void TelemetryChartWidget::paintEvent(QPaintEvent* event) {
 
     QPainterPath path;
     const double denominator = static_cast<double>(temperatures_.size() - 1);
-    for (qsizetype i = 0; i < temperatures_.size(); ++i) {
+    for (int i = 0; i < temperatures_.size(); ++i) {
         const double x = plot.left() + plot.width() * static_cast<double>(i) / denominator;
         const double normalized = std::clamp(temperatures_.at(i), 0.0, 100.0) / 100.0;
         const double y = plot.bottom() - normalized * plot.height();

@@ -74,7 +74,7 @@ Do not pass a `QJsonObject` through the application. Parse once into value types
 struct NetworkSettings {
     std::chrono::milliseconds heartbeatInterval;
     std::chrono::milliseconds heartbeatTimeout;
-    qsizetype maximumFrameBytes;
+    int maximumFrameBytes;
 };
 
 struct ApplicationSettings {
